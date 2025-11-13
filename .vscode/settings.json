@@ -1,5 +1,13 @@
 {
-    "python.analysis.extraPaths": [
-        "./benchmarks/tuto_global_optimization_photonics"
-    ]
+  "python.analysis.extraPaths": [
+    "./benchmarks/tuto_global_optimization_photonics"
+  ],
+  "files.exclude": {
+    "**/.git": true,
+    "**/.svn": true,
+    "**/.hg": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true
+  },
+  "hide-files.files": []
 }

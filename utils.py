@@ -1,31 +1,14 @@
 import numpy as np
-
-try:
-    from ioh import LogInfo
-    from ioh.logger import AbstractLogger
-except ImportError:
-    LogInfo = None
-    
-    class AbstractLogger:
-        """Fallback AbstractLogger when ioh is not available."""
-        def __init__(self, *args, **kwargs):
-            pass
-        
-        def __call__(self, log_info):
-            pass
-        
-        def reset(self):
-            pass
-
-class ThresholdReachedException(Exception):
-    """The algorithm reached the lower threshold."""
-
-    pass
+from ioh import logger, LogInfo
 
 class OverBudgetException(Exception):
     """The algorithm tried to do more evaluations than allowed."""
-
     pass
+
+class NoCodeException(Exception):
+    """Could not extract generated code."""
+    pass
+
 
 def correct_aoc(ioh_function, logger, budget):
     """Correct aoc values in case a run stopped before the budget was exhausted
@@ -54,7 +37,7 @@ def correct_aoc(ioh_function, logger, budget):
     return 1 - aoc
 
 
-class aoc_logger(AbstractLogger):
+class aoc_logger(logger.AbstractLogger):
     """aoc_logger class implementing the logging module for ioh."""
 
     def __init__(
@@ -63,7 +46,6 @@ class aoc_logger(AbstractLogger):
         lower=1e-8,
         upper=1e8,
         scale_log=True,
-        stop_on_threshold = False,
         *args,
         **kwargs,
     ):
@@ -77,7 +59,6 @@ class aoc_logger(AbstractLogger):
         self.lower = lower
         self.upper = upper
         self.budget = budget
-        self.stop_on_threshold = stop_on_threshold
         self.transform = lambda x: np.log10(x) if scale_log else (lambda x: x)
 
     def __call__(self, log_info: LogInfo):
@@ -90,20 +71,18 @@ class aoc_logger(AbstractLogger):
             raise OverBudgetException
         if log_info.evaluations == self.budget:
             return
-        if self.stop_on_threshold and abs(log_info.raw_y_best) < self.lower:
-            raise ThresholdReachedException
         y_value = np.clip(log_info.raw_y_best, self.lower, self.upper)
         self.aoc += (self.transform(y_value) - self.transform(self.lower)) / (
             self.transform(self.upper) - self.transform(self.lower)
         )
 
     def reset(self, func):
-        if hasattr(super(), 'reset'):
-            super().reset()
+        super().reset()
         self.aoc = 0
 
 
-class budget_logger(AbstractLogger):
+
+class budget_logger(logger.AbstractLogger):
     """budget_logger class implementing the logging module for ioh."""
 
     def __init__(
@@ -130,5 +109,4 @@ class budget_logger(AbstractLogger):
             raise OverBudgetException
 
     def reset(self):
-        if hasattr(super(), 'reset'):
-            super().reset()
+        super().reset()

@@ -3,8 +3,6 @@ import re
 from difflib import SequenceMatcher
 from typing import List
 import numpy as np
-import subprocess
-import os
 
 
 class NoCodeException(Exception):
@@ -20,90 +18,123 @@ def handle_timeout(signum, frame):
 
 def apply_unified_diff(text: str, diff: str) -> str:
     """
-    Apply a unified diff to the given text using the system `patch` command.
+    Apply a unified diff to the given text using pure Python implementation.
 
-    This delegates all parsing and application logic to the external `patch`
-    utility, which is far more robust than a hand-rolled parser. It handles
-    context mismatches, fuzz factors, and edge cases like missing EOF newlines.
-
-    ```text
-    ┌─────────────┐
-    │   INPUT     │
-    │  text:str   │──┐
-    └─────────────┘  │
-                     ▼
-               ┌───────────┐
-               │ tempfile  │  → holds original text
-               └───────────┘
-                     │
-                     ▼
-              ┌──────────────┐
-              │  patch cmd   │ ← receives unified diff on stdin
-              └──────────────┘
-                     │
-                     ▼
-               ┌───────────┐
-               │ tempfile  │ → now contains patched text
-               └───────────┘
-                     │
-                     ▼
-                patched:str
-    ```
+    This function parses and applies unified diff patches without relying on
+    external system commands, making it cross-platform compatible.
 
     Args:
         text: The original text to patch.
         diff: The unified diff (as produced by `git diff`, `difflib.unified_diff`, etc.).
-        strip: Optional `-p` value to pass to `patch` (number of path segments to strip).
-               Useful if the diff contains file paths you want ignored.
 
     Returns:
         The patched text as a string.
 
     Raises:
-        subprocess.CalledProcessError: If `patch` fails and returns a nonzero exit code.
-        FileNotFoundError: If `patch` is not installed.
+        ValueError: If the diff format is invalid or cannot be applied.
     """
-    import tempfile
-
-    # check that the text ends in a newline
-
+    
+    # Ensure text ends with newline for consistent processing
     if not text.endswith("\n"):
         text += "\n"
 
+    # Normalize diff format
     d = diff.lstrip()
     if not d.startswith("--- "):
         diff = f"--- a\n+++ a\n{diff}"
 
-    # Ensure diff ends with a newline too
+    # Ensure diff ends with newline
     if not diff.endswith("\n"):
         diff += "\n"
 
-    tf = tempfile.NamedTemporaryFile("w+", delete=False)
-    try:
-        tf.write(text)
-        tf.flush()
-        path = tf.name
-    finally:
-        tf.close()  # critical: allow patch to replace the file
+    lines = text.splitlines(keepends=True)
+    diff_lines = diff.splitlines()
+    
+    # Parse the diff header
+    i = 0
+    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+        i += 1
+    
+    if i >= len(diff_lines):
+        # No hunks found, return original text
+        return text
+    
+    result_lines = lines[:]
+    
+    # Process each hunk
+    while i < len(diff_lines):
+        if not diff_lines[i].startswith("@@"):
+            i += 1
+            continue
+            
+        # Parse hunk header: @@ -start,count +start,count @@
+        hunk_header = diff_lines[i]
+        i += 1
+        
+        # Extract line numbers from hunk header
+        import re
+        match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", hunk_header)
+        if not match:
+            raise ValueError(f"Invalid hunk header: {hunk_header}")
+        
+        old_start = int(match.group(1)) - 1  # Convert to 0-based indexing
+        old_count = int(match.group(2)) if match.group(2) else 1
+        new_start = int(match.group(3)) - 1  # Convert to 0-based indexing
+        new_count = int(match.group(4)) if match.group(4) else 1
+        
+        # Collect hunk lines
+        hunk_lines = []
+        while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+            if diff_lines[i].startswith((" ", "+", "-")):
+                hunk_lines.append(diff_lines[i])
+            i += 1
+        
+        # Apply the hunk
+        result_lines = _apply_hunk(result_lines, hunk_lines, old_start, old_count)
+    
+    return "".join(result_lines)
 
-    try:
-        proc = subprocess.run(
-            ["patch", "-u", path],
-            input=diff.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Now read the (possibly replaced) file from disk
-        with open(path, "r", encoding="utf-8") as f:
-            newcode = f.read()
-            # finally, remove the temporary file
-    finally:
-        # Clean up even if patch failed
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-    return newcode
+
+def _apply_hunk(lines: List[str], hunk_lines: List[str], old_start: int, old_count: int) -> List[str]:
+    """Apply a single hunk to the lines."""
+    result = lines[:old_start]
+    
+    hunk_pos = 0
+    old_pos = old_start
+    
+    while hunk_pos < len(hunk_lines):
+        hunk_line = hunk_lines[hunk_pos]
+        
+        if hunk_line.startswith(" "):
+            # Context line - should match
+            expected = hunk_line[1:]
+            if not expected.endswith("\n"):
+                expected += "\n"
+            
+            if old_pos < len(lines) and lines[old_pos].rstrip() == expected.rstrip():
+                result.append(lines[old_pos])
+                old_pos += 1
+            else:
+                result.append(expected)
+                old_pos += 1
+            
+        elif hunk_line.startswith("-"):
+            # Deletion - skip the original line
+            old_pos += 1
+            
+        elif hunk_line.startswith("+"):
+            # Addition - add the new line
+            new_line = hunk_line[1:]
+            if not new_line.endswith("\n"):
+                new_line += "\n"
+            result.append(new_line)
+        
+        hunk_pos += 1
+    
+    # Add remaining lines after the hunk
+    result.extend(lines[old_pos:])
+    
+    return result
 
 
 def discrete_power_law_distribution(n, beta):

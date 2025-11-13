@@ -121,3 +121,13 @@ class ExperimentLogger:
             else:
                 file.write("Failed to extract config space")
         self.attempt = attempt
+
+    def log_aucs(self, attempt, aucs):
+        """
+        Logs the given AUCs (Area Under Curve) into a file, named based on the attempt identifier.
+        
+        Args:
+            attempt (int or str): The attempt identifier corresponding to the AUCs.
+            aucs (array_like): An array of AUC scores to be saved.
+        """
+        np.savetxt(f"{self.dirname}/try-{attempt}-aucs.txt", aucs)

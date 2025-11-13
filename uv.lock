@@ -1727,6 +1727,7 @@ source = { editable = "." }
 dependencies = [
     { name = "configspace" },
     { name = "google-generativeai" },
+    { name = "ioh" },
     { name = "joblib" },
     { name = "jsonlines" },
     { name = "numpy" },
@@ -1783,6 +1784,7 @@ llm-extras = [
 requires-dist = [
     { name = "configspace", specifier = ">=1.2.0,<2" },
     { name = "google-generativeai", specifier = ">=0.8.1,<0.9" },
+    { name = "ioh", specifier = ">=0.3.18" },
     { name = "joblib", specifier = ">=1.4.2,<2" },
     { name = "jsonlines", specifier = ">=4.0.0,<5" },
     { name = "numpy", specifier = ">=1.26.3,<2" },
