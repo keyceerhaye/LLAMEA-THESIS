@@ -12,13 +12,13 @@ This note explains how the Model-Aware Differential Architecture (MADA) layer pl
 
 ## Block Parsing & Metadata
 
-`BlockParser` (`parser.py`) splits an optimizer class into reusable blocks. By default it tracks `__init__`, `__call__`, and the optional orchestration hooks (`parent_selection`, `recombination`, `mutation`, `survivor_selection`). When a new individual is created, `MADAOperator.ensure_blocks` caches the parsed representation and stores the block metadata inside the `Solution` object:
+`BlockParser` (`parser.py`) splits an optimizer class into reusable blocks. By default it tracks the four orchestration hooks (`parent_selection`, `recombination`, `mutation`, `survivor_selection`). When a new individual is created, `MADAOperator.ensure_blocks` caches the parsed representation and stores the block metadata inside the `Solution` object:
 
 - **Imports/helpers** – captured and re-emitted so recombined children remain runnable.
 - **Block hashes** – SHA-256 digests let MADA detect when two individuals share identical method implementations.
 - **Placeholders** – if a class omits a target block, the parser injects a safe default so DS-TS can still ask the LLM to fill it in later.
 
-Because `__init__` and `__call__` are now tracked blocks, recombination/innovation can mutate the functional parts of the optimizer rather than just the unused helper stubs. This prevents the “identical parents” issue encountered when only placeholder hooks were being edited.
+Because these four hooks always contain meaningful logic, recombination/innovation can swap out targeted behaviors instead of editing unused stubs, keeping MADA’s bandits focused on the components it can actually recombine.
 
 ## Offspring Strategies
 
@@ -43,7 +43,7 @@ Each block maintains its own `DiscountedThompsonSampler` (`ds_ts.py`) so selecti
 - **Updates** – After offspring evaluation, `update_bandits` iterates over the lineage decisions flagged with `bandit=True` and calls `sampler.update(block_id, arm_name, reward, reward_override)`. The reward is `(child fitness − best parent fitness)` unless an override was specified (e.g., invalid snippet → 0).
 - **Snapshots** – Every selection returns a `snapshot_id` (`block:counter`) so lineage logs know which posterior state generated the decision. This gets written into the metadata for debugging.
 
-Because DS-TS works on a per-block basis, innovation can learn that (for example) changing the `mutation` method is beneficial while `__call__` should currently stick with α. This fine-grained credit assignment is what lets MADA reuse reliable building blocks while still probing new design ideas.
+Because DS-TS works on a per-block basis, innovation can learn that (for example) changing the `mutation` method is beneficial while `parent_selection` should currently stick with α. This fine-grained credit assignment is what lets MADA reuse reliable building blocks while still probing new design ideas.
 
 ## Reward Shaping & Baselines
 
