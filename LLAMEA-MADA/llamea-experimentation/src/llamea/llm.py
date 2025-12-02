@@ -217,9 +217,10 @@ class LLM(ABC):
 class OpenAI_LLM(LLM):
     """
     A manager class for handling requests to OpenAI's GPT models.
+    Also compatible with OpenAI-compatible APIs like AIML.
     """
 
-    def __init__(self, api_key, model="gpt-4-turbo", temperature=0.8, **kwargs):
+    def __init__(self, api_key, model="gpt-4-turbo", temperature=0.8, base_url=None, **kwargs):
         """
         Initializes the LLM manager with an API key and model name.
 
@@ -227,9 +228,12 @@ class OpenAI_LLM(LLM):
             api_key (str): api key for authentication.
             model (str, optional): model abbreviation. Defaults to "gpt-4-turbo".
                 Options are: gpt-3.5-turbo, gpt-4-turbo, gpt-4o, and others from OpeNAI models library.
+            base_url (str, optional): Custom API base URL for OpenAI-compatible endpoints (e.g., AIML).
         """
-        super().__init__(api_key, model, None, **kwargs)
+        super().__init__(api_key, model, base_url, **kwargs)
         self._client_kwargs = dict(api_key=api_key)
+        if base_url:
+            self._client_kwargs["base_url"] = base_url
         self.client = openai.OpenAI(**self._client_kwargs)
         logging.getLogger("openai").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.ERROR)

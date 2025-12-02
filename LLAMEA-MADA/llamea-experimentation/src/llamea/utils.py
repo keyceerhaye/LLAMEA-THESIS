@@ -1,7 +1,11 @@
 import ast
+import math
+import random
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import List
+
 import numpy as np
 
 
@@ -190,3 +194,85 @@ def code_distance(a, b):
         return 1 - SequenceMatcher(None, ast.dump(tree_a), ast.dump(tree_b)).ratio()
     except Exception:
         return 1.0
+
+
+@dataclass
+class _BanditArmState:
+    """Internal container for outer-loop bandit statistics."""
+
+    discounted_count: float = 0.0
+    discounted_sum: float = 0.0
+    mean: float = 0.0
+    last_theta: float = 0.0
+
+
+class DiscountedThompsonSampling:
+    """
+    Two-arm Discounted Thompson Sampling controller with Gaussian priors.
+
+    This lighter variant is tailored for the adaptive outer loop where we only
+    care about the discounted reward mean and the variance cap instead of the
+    full block-level bookkeeping used by the inner MADA operator.
+    """
+
+    def __init__(self, n_arms: int, gamma: float = 0.9, tau_max: float = 3.0):
+        if n_arms < 2:
+            raise ValueError("DiscountedThompsonSampling requires at least two arms.")
+        if not 0 < gamma <= 1:
+            raise ValueError("gamma must be in (0, 1].")
+        if tau_max <= 0:
+            raise ValueError("tau_max must be positive.")
+
+        self.gamma = gamma
+        self.tau_max = tau_max
+        self._arms = [_BanditArmState() for _ in range(n_arms)]
+
+    def select_arm(self) -> int:
+        """Sample each arm and return the index with the highest draw."""
+
+        best_idx = 0
+        best_theta = float("-inf")
+        for idx, state in enumerate(self._arms):
+            variance = self._posterior_variance(state.discounted_count)
+            theta = random.gauss(state.mean, variance)
+            state.last_theta = theta
+            if theta > best_theta:
+                best_theta = theta
+                best_idx = idx
+        return best_idx
+
+    def update(self, arm_index: int, reward: float) -> None:
+        """Apply exponential discounting and incorporate the observed reward."""
+
+        if not 0 <= arm_index < len(self._arms):
+            raise IndexError("arm_index out of range.")
+
+        # Apply global discount before inserting the new reward.
+        for state in self._arms:
+            state.discounted_count *= self.gamma
+            state.discounted_sum *= self.gamma
+
+        state = self._arms[arm_index]
+        state.discounted_count += 1.0
+        state.discounted_sum += reward
+        state.mean = (
+            state.discounted_sum / max(state.discounted_count, 1e-8)
+        )
+
+    def snapshot(self) -> List[dict]:
+        """Return a serialisable snapshot of the current posterior statistics."""
+
+        view = []
+        for state in self._arms:
+            view.append(
+                {
+                    "count": state.discounted_count,
+                    "mean": state.mean,
+                    "theta": state.last_theta,
+                }
+            )
+        return view
+
+    def _posterior_variance(self, discounted_count: float) -> float:
+        base = 1.0 / math.sqrt(max(discounted_count, 1e-8))
+        return min(base, self.tau_max)
