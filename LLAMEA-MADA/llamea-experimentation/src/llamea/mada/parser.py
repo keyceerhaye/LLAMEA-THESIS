@@ -9,6 +9,16 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 PLACEHOLDER_SIGNATURES = {
+    "__init__": (
+        "def __init__(self, budget=10000):\n"
+        "        self.budget = budget\n"
+        "        self.dim = None\n"
+        "        self.history = []"
+    ),
+    "__call__": (
+        "def __call__(self, func):\n"
+        "        raise NotImplementedError('Optimizer must implement __call__')"
+    ),
     "parent_selection": "def parent_selection(self, population):\n        return population",
     "recombination": "def recombination(self, parents):\n        return parents[0]",
     "mutation": "def mutation(self, candidate):\n        return candidate",
