@@ -144,6 +144,14 @@ class LLaMEA:
 The optimization algorithm should handle a wide range of tasks, which is evaluated on the BBOB test suite of 24 noiseless functions. Your task is to write the optimization algorithm in Python code to minimize the function value. The code should contain an `__init__(self, budget, dim)` function and the function `def __call__(self, func)`, which should optimize the black box function `func` using `self.budget` function evaluations.
 The func() can only be called as many times as the budget allows, not more. Each of the optimization functions has a search space between -5.0 (lower bound) and 5.0 (upper bound). The dimensionality can be varied.
 
+IMPORTANT: Structure your algorithm with these 4 REQUIRED methods (exact names):
+1. `def parent_selection(self, population)` - Select parent individuals from the population for reproduction. Returns selected parents.
+2. `def recombination(self, parents)` - Combine/crossover parents to create offspring. Returns offspring candidates.
+3. `def mutation(self, candidate)` - Apply mutation operator to a candidate solution. Returns mutated candidate.
+4. `def survivor_selection(self, population, offspring)` - Select survivors from population and offspring for the next generation. Returns the new population.
+
+These 4 methods will be used for algorithm recombination in an evolutionary framework. The `__call__` method should orchestrate these 4 methods in a main optimization loop.
+
 Give an excellent and novel heuristic algorithm to solve this task.
 """
         else:
@@ -151,26 +159,80 @@ Give an excellent and novel heuristic algorithm to solve this task.
 
         if example_prompt == None:
             self.example_prompt = """
-An example of such code (a simple random search), is as follows:
-```
+An example of such code (a simple evolutionary algorithm), is as follows:
+```python
 import numpy as np
 
-class RandomSearch:
+class SimpleEA:
     def __init__(self, budget=10000, dim=10):
         self.budget = budget
         self.dim = dim
+        self.pop_size = 20
         self.f_opt = np.inf
         self.x_opt = None
+        self.lb = -5.0
+        self.ub = 5.0
+
+    def parent_selection(self, population):
+        # Tournament selection
+        selected = []
+        for _ in range(len(population) // 2):
+            i, j = np.random.choice(len(population), 2, replace=False)
+            if population[i][1] < population[j][1]:
+                selected.append(population[i])
+            else:
+                selected.append(population[j])
+        return selected
+
+    def recombination(self, parents):
+        # Uniform crossover
+        offspring = []
+        for i in range(0, len(parents) - 1, 2):
+            p1, p2 = parents[i][0], parents[(i + 1) % len(parents)][0]
+            mask = np.random.random(self.dim) < 0.5
+            child = np.where(mask, p1, p2)
+            offspring.append(child)
+        return offspring
+
+    def mutation(self, candidate):
+        # Gaussian mutation
+        mutant = candidate + np.random.normal(0, 0.1, self.dim)
+        return np.clip(mutant, self.lb, self.ub)
+
+    def survivor_selection(self, population, offspring):
+        # Elitist: keep best from combined pool
+        combined = population + offspring
+        combined.sort(key=lambda x: x[1])
+        return combined[:self.pop_size]
 
     def __call__(self, func):
-        for i in range(self.budget):
-            x = np.random.uniform(func.bounds.lb, func.bounds.ub)
-            
+        # Initialize population
+        population = []
+        for _ in range(self.pop_size):
+            x = np.random.uniform(self.lb, self.ub, self.dim)
             f = func(x)
+            population.append((x, f))
             if f < self.f_opt:
-                self.f_opt = f
-                self.x_opt = x
+                self.f_opt, self.x_opt = f, x
+
+        evals = self.pop_size
+        while evals < self.budget:
+            parents = self.parent_selection(population)
+            offspring_candidates = self.recombination(parents)
             
+            offspring = []
+            for candidate in offspring_candidates:
+                mutant = self.mutation(candidate)
+                f = func(mutant)
+                evals += 1
+                offspring.append((mutant, f))
+                if f < self.f_opt:
+                    self.f_opt, self.x_opt = f, mutant
+                if evals >= self.budget:
+                    break
+
+            population = self.survivor_selection(population, offspring)
+
         return self.f_opt, self.x_opt
 ```
 """

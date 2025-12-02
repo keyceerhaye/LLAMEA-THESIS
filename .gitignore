@@ -193,3 +193,4 @@ benchmarks/ma_bbob/RS*
 exp-*
 
 benchmarks/
+!LLAMEA-MADA/llamea-experimentation/experiments/benchmarks/
