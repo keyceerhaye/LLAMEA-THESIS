@@ -6,14 +6,20 @@ import ast
 import hashlib
 import random
 import textwrap
+from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Deque, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
 from ..solution import Solution
 from .ds_ts import DiscountedThompsonSampler
 from .parser import BlockParser, ParsedAlgorithm
+
+PROMPT_GUARDRAILS = [
+    "- Keep shared state updates inside helper methods or __init__; do not introduce module-level globals.",
+    "- If the block depends on helpers such as update_archive(), call them instead of duplicating logic.",
+]
 
 
 @dataclass
@@ -40,6 +46,7 @@ class MADAOperator:
         tau_max: float = 3.0,
         rng_seed: Optional[int] = None,
         strategy_weights: Optional[Dict[str, float]] = None,
+        guardrail_window: int = 10,
     ):
         self.algorithm_manager = algorithm_manager
         self.parser = parser or BlockParser()
@@ -57,6 +64,9 @@ class MADAOperator:
         self.block_cache: Dict[str, ParsedAlgorithm] = {}
         self.strategy_weights = self._normalize_weights(strategy_weights)
         self.child_counter = 0
+        self.placeholder_threshold = 0.5
+        self.guardrail_window = guardrail_window
+        self._violation_history: Deque[str] = deque(maxlen=guardrail_window)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -119,6 +129,7 @@ class MADAOperator:
             solution.set_mada_blocks(parsed.to_metadata())
         else:
             solution.metadata["mada_blocks"] = parsed.to_metadata()
+        self._log_placeholder_ratio(solution, parsed)
         return parsed
 
     # ------------------------------------------------------------------ #
@@ -127,6 +138,7 @@ class MADAOperator:
     def _legacy_offspring(
         self, parent: Solution, population_summary: str
     ) -> OffspringProposal:
+        self._push_guardrail_feedback()
         self.algorithm_manager.tried_algorithms = f"Current population:\n{population_summary}"
         self.algorithm_manager.last_algorithm = (
             f"# Name: {parent.description or parent.name}\n# Code:\n```python\n{parent.code}\n```"
@@ -162,25 +174,57 @@ class MADAOperator:
         overrides: Dict[str, str] = {}
         decisions: List[Dict[str, object]] = []
         parent_ids = set()
+        helper_bundle = self._empty_helper_bundle()
 
         for block in self.parser.target_blocks:
             donor_label, parsed, donor = self.random.choice(
                 [("alpha", parsed_alpha, alpha), ("beta", parsed_beta, beta)]
             )
-            overrides[block] = parsed.blocks[block]
-            decisions.append(
-                {
-                    "block": block,
-                    "arm": f"recomb_{donor_label}",
-                    "parent_id": donor.id,
-                    "source_hash": parsed.hashes[block],
-                    "bandit": False,
-                }
-            )
+            snippet = parsed.blocks[block]
+            decision = {
+                "block": block,
+                "arm": f"recomb_{donor_label}",
+                "parent_id": donor.id,
+                "source_hash": parsed.hashes[block],
+                "bandit": False,
+            }
+            decisions.append(decision)
             parent_ids.add(donor.id)
 
-        child_name = self._child_name(parsed_alpha.class_name, suffix="Recomb")
-        code = self.parser.assemble(parsed_alpha, overrides=overrides, class_name=child_name)
+            success, updated_bundle, reason = self._verify_dependencies(
+                block,
+                parsed_alpha,
+                snippet,
+                helper_bundle,
+                donor_parsed=parsed,
+            )
+            if success:
+                helper_bundle = updated_bundle
+                overrides[block] = snippet
+            else:
+                overrides[block] = parsed_alpha.blocks[block]
+                decision["dependency_issue"] = reason
+                self._record_violation(reason)
+                decision["parent_id"] = alpha.id
+                decision["source_hash"] = parsed_alpha.hashes[block]
+                parent_ids.add(alpha.id)
+
+        changed_blocks = sorted(
+            {
+                decision["block"]
+                for decision in decisions
+                if decision.get("parent_id") != alpha.id
+            }
+        )
+        child_name = self._child_name(
+            parsed_alpha.class_name, strategy="Recomb", changed_blocks=changed_blocks
+        )
+        code = self.parser.assemble(
+            parsed_alpha,
+            overrides=overrides,
+            class_name=child_name,
+            helper_overrides=helper_bundle,
+        )
         lineage = {
             "strategy": "recombination",
             "decisions": decisions,
@@ -204,6 +248,7 @@ class MADAOperator:
         overrides: Dict[str, str] = {}
         decisions: List[Dict[str, object]] = []
         parent_ids = {alpha.id, beta.id}
+        helper_bundle = self._empty_helper_bundle()
 
         for block in self.parser.target_blocks:
             sampler = self.bandits[block]
@@ -234,22 +279,61 @@ class MADAOperator:
                     parent_id = meta.get("parent_id")
                     source_hash = meta.get("hash", "")
 
-            overrides[block] = snippet
-            decisions.append(
-                {
-                    "block": block,
-                    "arm": arm,
-                    "theta": theta,
-                    "snapshot": snapshot,
-                    "parent_id": parent_id,
-                    "source_hash": source_hash,
-                    "bandit": True,
-                    "reward_override": reward_override,
-                }
-            )
+            verify_source = None
+            if arm == "alpha":
+                verify_source = parsed_alpha
+            elif arm == "beta":
+                verify_source = parsed_beta
+            decision = {
+                "block": block,
+                "arm": arm,
+                "theta": theta,
+                "snapshot": snapshot,
+                "parent_id": parent_id,
+                "source_hash": source_hash,
+                "bandit": True,
+                "reward_override": reward_override,
+            }
 
-        child_name = self._child_name(parsed_alpha.class_name, suffix="MADA")
-        code = self.parser.assemble(parsed_alpha, overrides=overrides, class_name=child_name)
+            if snippet is not None:
+                success, updated_bundle, reason = self._verify_dependencies(
+                    block,
+                    parsed_alpha,
+                    snippet,
+                    helper_bundle,
+                    donor_parsed=verify_source,
+                )
+                if success:
+                    helper_bundle = updated_bundle
+                    overrides[block] = snippet
+                else:
+                    decision["dependency_issue"] = reason
+                    self._record_violation(reason)
+                    snippet = parsed_alpha.blocks[block]
+                    overrides[block] = snippet
+                    decision["parent_id"] = alpha.id
+                    decision["source_hash"] = parsed_alpha.hashes[block]
+                    if reward_override is None and arm == "innovation":
+                        decision["reward_override"] = 0.0
+            else:
+                overrides[block] = parsed_alpha.blocks[block]
+
+            decisions.append(decision)
+
+        changed_blocks = sorted(
+            decision["block"]
+            for decision in decisions
+            if decision.get("arm") == "innovation"
+        )
+        child_name = self._child_name(
+            parsed_alpha.class_name, strategy="MADA", changed_blocks=changed_blocks
+        )
+        code = self.parser.assemble(
+            parsed_alpha,
+            overrides=overrides,
+            class_name=child_name,
+            helper_overrides=helper_bundle,
+        )
         lineage = {
             "strategy": "innovation",
             "decisions": decisions,
@@ -277,14 +361,23 @@ class MADAOperator:
     ) -> tuple[Optional[str], Dict[str, object]]:
         """Ask the AlgorithmManager for a fresh block implementation."""
 
+        self._push_guardrail_feedback()
         baseline = template.blocks[block]
         signature = baseline.splitlines()[0] if baseline else f"def {block}(self, *args, **kwargs):"
+        helper_context = self._format_helper_context(template, block)
+        guardrail_text = self._format_guardrail_block()
+        guardrail_section = f"\n{guardrail_text}\n" if guardrail_text else ""
         prompt = textwrap.dedent(
             f"""
             The current population summary is:\n{population_summary}\n
             Improve the `{block}` method of the optimizer class `{template.class_name}`.
             Use the exact signature `{signature}` and return only the method definition
             inside a Python code block. Keep helper references consistent with the class.
+
+            Helper/context for `{block}`:
+            {helper_context}
+
+            {guardrail_section}
 
             Existing implementation for reference:
             ```python
@@ -311,14 +404,221 @@ class MADAOperator:
 
     def _valid_block(self, snippet: str, block: str) -> bool:
         if not snippet.startswith("def "):
+            self._record_violation(f"invalid_block:{block}")
             return False
         if not snippet.split("(")[0].endswith(block):
+            self._record_violation(f"invalid_block:{block}")
             return False
         try:
             ast.parse(textwrap.dedent(snippet))
             return True
         except SyntaxError:
+            self._record_violation(f"invalid_block:{block}")
             return False
+
+    # ------------------------------------------------------------------ #
+    # Dependency + helper utilities
+    # ------------------------------------------------------------------ #
+    def _format_helper_context(self, template: ParsedAlgorithm, block: str) -> str:
+        bundle = template.helper_groups.get(block) or {}
+        helpers = sorted(list(bundle.get("helpers", [])))
+        attributes = sorted(list(bundle.get("attributes", [])))
+        lines = []
+        if helpers:
+            lines.append(f"Available helper methods: {', '.join(helpers)}")
+        else:
+            lines.append("Available helper methods: none detected; reuse shared helpers only.")
+        if attributes:
+            lines.append(f"Shared attributes referenced: {', '.join(attributes)}")
+        else:
+            lines.append("Shared attributes referenced: none beyond default state.")
+        return "\n".join(lines)
+
+    def _empty_helper_bundle(self) -> Dict[str, Dict[str, str]]:
+        return {"methods": {}, "init_assignments": {}}
+
+    def _clone_helper_bundle(
+        self, bundle: Optional[Dict[str, Dict[str, str]]]
+    ) -> Dict[str, Dict[str, str]]:
+        bundle = bundle or {}
+        return {
+            "methods": dict(bundle.get("methods", {})),
+            "init_assignments": dict(bundle.get("init_assignments", {})),
+        }
+
+    def _verify_dependencies(
+        self,
+        block: str,
+        template: ParsedAlgorithm,
+        snippet: str,
+        helper_bundle: Dict[str, Dict[str, str]],
+        donor_parsed: Optional[ParsedAlgorithm] = None,
+    ) -> tuple[bool, Dict[str, Dict[str, str]], Optional[str]]:
+        working_bundle = self._clone_helper_bundle(helper_bundle)
+        success, working_bundle, reason = self._ensure_snippet_support(
+            snippet,
+            template,
+            donor_parsed,
+            working_bundle,
+            visited=set(),
+        )
+        if not success:
+            return False, helper_bundle, reason
+        return True, working_bundle, None
+
+    def _ensure_snippet_support(
+        self,
+        snippet: str,
+        template: ParsedAlgorithm,
+        donor_parsed: Optional[ParsedAlgorithm],
+        helper_bundle: Dict[str, Dict[str, str]],
+        visited: Set[str],
+    ) -> tuple[bool, Dict[str, Dict[str, str]], Optional[str]]:
+        deps = self._dependencies_from_snippet(snippet)
+        available_helpers = set(template.other_methods.keys()) | set(
+            helper_bundle["methods"].keys()
+        )
+
+        for helper in deps["helpers"]:
+            if helper in visited or helper in available_helpers or helper in self.parser.target_blocks:
+                continue
+            if donor_parsed is None:
+                return False, helper_bundle, f"missing_helper:{helper}"
+            helper_snippet = self._locate_helper_snippet(donor_parsed, helper)
+            if helper_snippet is None:
+                return False, helper_bundle, f"missing_helper:{helper}"
+            helper_bundle["methods"][helper] = helper_snippet
+            visited.add(helper)
+            success, helper_bundle, reason = self._ensure_snippet_support(
+                helper_snippet,
+                template,
+                donor_parsed,
+                helper_bundle,
+                visited,
+            )
+            if not success:
+                return False, helper_bundle, reason
+            available_helpers.add(helper)
+
+        missing_attrs = [
+            attr
+            for attr in deps["attributes"]
+            if attr not in template.init_attributes
+            and attr not in helper_bundle["init_assignments"]
+        ]
+        if missing_attrs:
+            assignments = self._resolve_attribute_assignments(missing_attrs, donor_parsed)
+            if assignments is None:
+                return False, helper_bundle, f"missing_attributes:{','.join(missing_attrs)}"
+            helper_bundle["init_assignments"].update(assignments)
+
+        return True, helper_bundle, None
+
+    def _locate_helper_snippet(
+        self, parsed: Optional[ParsedAlgorithm], helper_name: str
+    ) -> Optional[str]:
+        if parsed is None:
+            return None
+        if helper_name in parsed.other_methods:
+            return parsed.other_methods[helper_name]
+        if helper_name in parsed.blocks:
+            return parsed.blocks[helper_name]
+        return None
+
+    def _resolve_attribute_assignments(
+        self, attributes: List[str], donor_parsed: Optional[ParsedAlgorithm]
+    ) -> Optional[Dict[str, str]]:
+        if donor_parsed is None:
+            return None
+        assignments: Dict[str, str] = {}
+        for attr in attributes:
+            stmt = donor_parsed.init_assignments.get(attr)
+            if stmt is None:
+                return None
+            assignments[attr] = stmt
+        return assignments
+
+    def _dependencies_from_snippet(self, snippet: str) -> Dict[str, Set[str]]:
+        try:
+            module = ast.parse(textwrap.dedent(snippet))
+        except SyntaxError:
+            return {"helpers": set(), "attributes": set()}
+        func_def = next(
+            (node for node in module.body if isinstance(node, ast.FunctionDef)),
+            None,
+        )
+        if func_def is None:
+            return {"helpers": set(), "attributes": set()}
+        visitor = _SnippetDependencyVisitor()
+        visitor.visit(func_def)
+        return {"helpers": visitor.helpers, "attributes": visitor.attributes}
+
+    def _log_placeholder_ratio(self, solution: Solution, parsed: ParsedAlgorithm) -> None:
+        coverage = getattr(parsed, "coverage", {}) or {}
+        ratio = coverage.get("placeholder_ratio")
+        if ratio is None or ratio < self.placeholder_threshold:
+            return
+        logger = getattr(self.algorithm_manager, "logger", None)
+        if logger and hasattr(logger, "log_conversation"):
+            name = solution.name or parsed.class_name
+            message = (
+                f"[MADA] Placeholder ratio {ratio:.2f} detected for {name}. "
+                "Verify parser heuristics or provide richer prompts."
+            )
+            try:
+                logger.log_conversation("system", message)
+            except Exception:
+                pass
+        self._record_violation("high_placeholder_ratio")
+
+    def _record_violation(self, reason: Optional[str]) -> None:
+        if not reason:
+            return
+        bucket = reason.split(":", 1)[0]
+        self._violation_history.append(bucket)
+
+    def _guardrail_feedback(self) -> str:
+        if not self._violation_history:
+            return ""
+        counts = Counter(self._violation_history)
+        top = counts.most_common(3)
+        fragments = []
+        for key, count in top:
+            label = self._friendly_violation_label(key)
+            fragments.append(f"{label}: {count}")
+        return "; ".join(fragments)
+
+    def _friendly_violation_label(self, key: str) -> str:
+        mapping = {
+            "missing_helper": "missing helper support",
+            "missing_attributes": "missing __init__ attributes",
+            "high_placeholder_ratio": "high placeholder ratio",
+            "invalid_block": "invalid block syntax",
+        }
+        return mapping.get(key, key.replace("_", " "))
+
+    def _guardrail_lines(self) -> List[str]:
+        lines = list(PROMPT_GUARDRAILS)
+        summary = self._guardrail_feedback()
+        if summary:
+            lines.append(f"- Recent issues observed: {summary}")
+        return lines
+
+    def _format_guardrail_block(self) -> str:
+        lines = self._guardrail_lines()
+        if not lines:
+            return ""
+        return "Please respect the following guardrails:\n" + "\n".join(lines)
+
+    def _push_guardrail_feedback(self) -> None:
+        updater = getattr(self.algorithm_manager, "update_guardrail_feedback", None)
+        if not callable(updater):
+            return
+        summary = self._guardrail_feedback()
+        try:
+            updater(summary)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Misc helpers
@@ -332,9 +632,24 @@ class MADAOperator:
                 return strategy
         return "innovation"
 
-    def _child_name(self, base: str, suffix: str) -> str:
+    def _child_name(
+        self, base: str, strategy: str, changed_blocks: Optional[List[str]] = None
+    ) -> str:
         self.child_counter += 1
-        return f"{base}{suffix}{self.child_counter}"
+        tag = self._summarize_blocks_for_name(changed_blocks)
+        base_stub = base[:18].replace(" ", "")
+        return f"{base_stub}_{strategy}_{tag}_{self.child_counter:04d}"
+
+    def _summarize_blocks_for_name(
+        self, blocks: Optional[Sequence[str]]
+    ) -> str:
+        if not blocks:
+            return "stable"
+        trimmed = [block.replace("_", "") for block in blocks[:3]]
+        tag = "_".join(trimmed)
+        if len(blocks) > 3:
+            tag += "_more"
+        return tag or "stable"
 
     def _extract_class_name(self, code: str, default: str) -> str:
         for line in code.splitlines():
@@ -360,3 +675,30 @@ class MADAOperator:
             return default
         return {key: value / total for key, value in sanitized.items()}
 
+
+class _SnippetDependencyVisitor(ast.NodeVisitor):
+    """Minimal visitor to inspect helper calls/attribute usage."""
+
+    def __init__(self):
+        self.helpers: Set[str] = set()
+        self.attributes: Set[str] = set()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id == "self":
+                self.helpers.add(func.attr)
+                self.visit(func.value)
+            else:
+                self.visit(func)
+        else:
+            self.visit(func)
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.value, ast.Name) and node.value.id == "self":
+            self.attributes.add(node.attr)
+        self.generic_visit(node)

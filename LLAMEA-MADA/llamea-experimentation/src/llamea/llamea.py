@@ -17,6 +17,7 @@ from ConfigSpace import ConfigurationSpace
 from joblib import Parallel, delayed
 
 from .loggers import ExperimentLogger
+from .llm import _append_guardrails
 from .solution import Solution
 from .utils import (
     NoCodeException,
@@ -186,6 +187,7 @@ Provide the Python code, a one-line description with the main idea (without ente
 Space: <configuration_space>"""
         else:
             self.output_format_prompt = output_format_prompt
+        self.output_format_prompt = _append_guardrails(self.output_format_prompt)
         self.diff_output_format_prompt = """
 Provide only the unified diff patch for the requested changes. Begin with
 `--- original.py` and `+++ updated.py` headers and enclose the patch in a
@@ -198,12 +200,37 @@ markdown code block labelled as diff:
 <patch>
 ```
 """
+        self.diff_output_format_prompt = _append_guardrails(
+            self.diff_output_format_prompt
+        )
         self.mutation_prompts = mutation_prompts
         self.adaptive_mutation = adaptive_mutation
         if mutation_prompts == None:
+            # Default to a purely exploratory mutation operator that behaves like a
+            # fresh parent initialization, but conditioned on the current solution.
+            # It asks for a new optimizer compatible with the MADA framework and the
+            # original BBOB-style task specification.
             self.mutation_prompts = [
-                "Refine the strategy of the selected solution to improve it.",  # small mutation
-                # "Generate a new algorithm that is different from the algorithms you have tried before.", #new random solution
+                (
+                    "Random new: Design a completely new optimizer algorithm for the same black-box "
+                    "optimization task as described in the initialization instructions "
+                    "(BBOB-style functions, budget-limited evaluations, bounds [-5, 5], etc.). "
+                    "Start from the CURRENT optimizer only as inspiration, but you are free to "
+                    "replace its strategy entirely.\n\n"
+                    "You MUST:\n"
+                    "- Keep the optimizer class name and all its public method signatures unchanged "
+                    "(including __init__ and any methods required by the MADA implementation).\n"
+                    "- Ensure the algorithm still works as a drop-in replacement in the existing "
+                    "MADA pipeline (do not break required helpers, attributes, or interactions).\n"
+                    "- Respect the evaluation budget semantics and problem bounds as in the "
+                    "initial task description.\n"
+                    "- Avoid introducing new external dependencies, global state, file I/O, or "
+                    "network calls; restrict stochasticity to the random utilities already used "
+                    "in this framework.\n"
+                    "- Return only valid Python code for the optimizer class inside a single "
+                    "```python ... ``` code block, with no explanation or commentary outside "
+                    "the code block.\n"
+                ),
             ]
         self.budget = budget
         self.n_parents = n_parents
@@ -493,15 +520,77 @@ With code:
             list: List of new selected population.
         """
         reverse = self.minimization == False
+
+        def _select_unique(population):
+            """Helper: select best parents preferring distinct code and fitness when possible."""
+            sorted_pop = sorted(population, key=lambda x: x.fitness, reverse=reverse)
+            if not sorted_pop:
+                return []
+
+            selected = []
+            best = sorted_pop[0]
+            selected.append(best)
+
+            if self.n_parents == 1:
+                return selected
+
+            best_fitness = best.fitness
+            best_code = best.code or ""
+
+            # Prefer a second parent that is both code-distinct and strictly worse in fitness.
+            second = None
+            for ind in sorted_pop[1:]:
+                code_key = ind.code or ""
+                if code_key == best_code:
+                    continue
+                if ind.fitness < best_fitness:
+                    second = ind
+                    break
+
+            # If all candidates with different code have the same fitness,
+            # allow equal fitness but distinct code.
+            if second is None:
+                for ind in sorted_pop[1:]:
+                    code_key = ind.code or ""
+                    if code_key != best_code:
+                        second = ind
+                        break
+
+            # As a last resort (e.g., only clones in the population), fall back to the next best individual.
+            if second is None and len(sorted_pop) > 1:
+                second = sorted_pop[1]
+
+            if second is not None:
+                selected.append(second)
+
+            # If more parents are requested, fill remaining slots with next best,
+            # avoiding exact code duplicates when possible.
+            seen_codes = {best_code, second.code or "" if second is not None else ""}
+            for ind in sorted_pop[2:]:
+                if len(selected) >= self.n_parents:
+                    break
+                code_key = ind.code or ""
+                if code_key in seen_codes:
+                    continue
+                seen_codes.add(code_key)
+                selected.append(ind)
+
+            if len(selected) < self.n_parents:
+                for ind in sorted_pop:
+                    if len(selected) >= self.n_parents:
+                        break
+                    if ind not in selected:
+                        selected.append(ind)
+
+            return selected
+
         if self.elitism:
             combined_population = parents + offspring
             combined_population = self.apply_niching(combined_population)
-            combined_population.sort(key=lambda x: x.fitness, reverse=reverse)
-            new_population = combined_population[: self.n_parents]
+            new_population = _select_unique(combined_population)
         else:
             offspring = self.apply_niching(list(offspring))
-            offspring.sort(key=lambda x: x.fitness, reverse=reverse)
-            new_population = offspring[: self.n_parents]
+            new_population = _select_unique(offspring)
 
         return new_population
 

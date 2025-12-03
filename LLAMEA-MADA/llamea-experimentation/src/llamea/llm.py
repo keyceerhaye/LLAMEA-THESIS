@@ -19,6 +19,22 @@ from .solution import Solution
 from .utils import NoCodeException, apply_unified_diff
 
 
+GUARDRAIL_HEADER = "Please respect the following guardrails:"
+MADA_GUARDRAILS = (
+    "- Keep shared state updates inside helper methods or __init__; do not introduce module-level globals.\n"
+    "- If the block depends on helpers such as update_archive(), call them instead of duplicating logic.\n"
+    "- Avoid fitness-proportional (roulette) survivor selection; prefer deterministic truncation, rank-based, or inverse-fitness probabilities."
+)
+
+
+def _append_guardrails(prompt: str) -> str:
+    prompt = prompt.rstrip()
+    if GUARDRAIL_HEADER in prompt:
+        return prompt
+    guardrail_block = f"\n{GUARDRAIL_HEADER}\n{MADA_GUARDRAILS}"
+    return prompt + guardrail_block
+
+
 class LLM(ABC):
     def __init__(
         self,
