@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import math
 import random
 import textwrap
 from collections import Counter, deque
@@ -14,7 +15,7 @@ import numpy as np
 
 from ..solution import Solution
 from .ds_ts import DiscountedThompsonSampler
-from .parser import BlockParser, ParsedAlgorithm
+from .parser import BlockParser, ParsedAlgorithm, PLACEHOLDER_SIGNATURES
 
 PROMPT_GUARDRAILS = [
     "- Keep shared state updates inside helper methods or __init__; do not introduce module-level globals.",
@@ -33,6 +34,28 @@ class OffspringProposal:
     strategy: str
     parent_ids: List[str]
     diagnostics: Dict[str, object] = field(default_factory=dict)
+
+
+class PlaceholderAbort(Exception):
+    """Raised when a parent is too placeholder-heavy for recombination."""
+
+    def __init__(self, parent: Solution, ratio: float, block: Optional[str] = None):
+        self.parent = parent
+        self.ratio = ratio
+        self.block = block
+        super().__init__(
+            f"Placeholder pressure ({ratio:.2f}) for {parent.name}"
+            + (f" block {block}" if block else "")
+        )
+
+
+class InnovationAbort(Exception):
+    """Raised when innovation fell back to alpha for most blocks."""
+
+    def __init__(self, parent: Solution, reason: str):
+        self.parent = parent
+        self.reason = reason
+        super().__init__(reason)
 
 
 class MADAOperator:
@@ -63,10 +86,26 @@ class MADAOperator:
         }
         self.block_cache: Dict[str, ParsedAlgorithm] = {}
         self.strategy_weights = self._normalize_weights(strategy_weights)
+        self.default_strategy_weights = dict(self.strategy_weights)
+        self.boosted_strategy_weights = self._normalize_weights(
+            {"innovation": 0.5, "recombination": 0.2, "legacy": 0.3}
+        )
+        self._boost_generations_remaining = 0
+        self.strategy_failure_counts = Counter()
+        self.strategy_cooldowns: Dict[str, int] = {
+            key: 0 for key in self.strategy_weights
+        }
+        self.failure_threshold = 2
+        self.cooldown_length = 5
         self.child_counter = 0
         self.placeholder_threshold = 0.5
+        self.placeholder_block_threshold = 0.3
         self.guardrail_window = guardrail_window
         self._violation_history: Deque[str] = deque(maxlen=guardrail_window)
+        (
+            self.expected_signature_headers,
+            self.expected_signature_args,
+        ) = self._build_expected_signatures()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -76,6 +115,7 @@ class MADAOperator:
         parents: Sequence[Solution],
         focal_parent: Optional[Solution] = None,
         population_summary: str = "",
+        force_strategy: Optional[str] = None,
     ) -> OffspringProposal:
         """Return code + lineage for a new offspring according to the plan."""
 
@@ -86,7 +126,10 @@ class MADAOperator:
         alpha = ordered[0]
         beta = ordered[1] if len(ordered) > 1 else ordered[0]
         focal = focal_parent or self.random.choice(ordered)
-        strategy = self._sample_strategy()
+        if force_strategy and force_strategy not in self.strategy_weights:
+            raise ValueError(f"force_strategy must be one of {list(self.strategy_weights)}")
+        self._tick_strategy_cooldowns()
+        strategy = force_strategy or self._sample_strategy()
 
         try:
             if strategy == "legacy":
@@ -94,6 +137,17 @@ class MADAOperator:
             if strategy == "recombination":
                 return self._recombination_offspring(alpha, beta)
             return self._innovative_offspring(alpha, beta, population_summary)
+        except PlaceholderAbort as exc:
+            self._log_strategy_event(
+                f"[MADA] Placeholder pressure detected ({exc.ratio:.2f}); "
+                f"requesting legacy rewrite for {exc.parent.name}."
+            )
+            return self._legacy_offspring(exc.parent, population_summary)
+        except InnovationAbort as exc:
+            self._log_strategy_event(
+                f"[MADA] Innovation aborted: {exc.reason}. Falling back to legacy."
+            )
+            return self._legacy_offspring(exc.parent, population_summary)
         except Exception:
             # Fallback to legacy mutation if anything goes wrong.
             return self._legacy_offspring(focal, population_summary)
@@ -117,6 +171,65 @@ class MADAOperator:
                 reward=reward,
                 reward_override=decision.get("reward_override"),
             )
+
+    def boost_exploration(self, duration: int = 3) -> None:
+        """Temporarily bias sampling toward exploration-heavy weights."""
+
+        duration = max(1, int(duration))
+        self.strategy_weights = dict(self.boosted_strategy_weights)
+        self._boost_generations_remaining = duration
+        self._log_strategy_event(
+            f"[MADA] Exploration boost enabled for {duration} generations."
+        )
+
+    def reset_strategy_weights(self, message: Optional[str] = None) -> None:
+        """Restore strategy weights to their defaults."""
+
+        if (
+            self._boost_generations_remaining == 0
+            and self.strategy_weights == self.default_strategy_weights
+        ):
+            return
+        self.strategy_weights = dict(self.default_strategy_weights)
+        self._boost_generations_remaining = 0
+        note = message or "[MADA] Strategy weights reset to defaults."
+        self._log_strategy_event(note)
+
+    def step_generation(self) -> None:
+        """Decay any temporary exploration boost once per generation."""
+
+        if self._boost_generations_remaining > 0:
+            self._boost_generations_remaining -= 1
+            if self._boost_generations_remaining == 0:
+                self.reset_strategy_weights(
+                    "[MADA] Exploration boost window elapsed; weights restored."
+                )
+
+    def record_strategy_outcome(
+        self, strategy: str, success: bool, error: Optional[str] = None
+    ) -> None:
+        """Track repeated failures per strategy so we can temporarily disable them."""
+
+        if strategy not in self.strategy_weights:
+            return
+        if success:
+            self.strategy_failure_counts[strategy] = 0
+            return
+
+        self.strategy_failure_counts[strategy] += 1
+        self._log_strategy_event(
+            f"[MADA] Strategy {strategy} failure count="
+            f"{self.strategy_failure_counts[strategy]} (error: {error or 'n/a'})"
+        )
+        if self.strategy_failure_counts[strategy] >= self.failure_threshold:
+            self.strategy_cooldowns[strategy] = self.cooldown_length
+            self.strategy_failure_counts[strategy] = 0
+            self._record_violation(f"{strategy}_disabled")
+            self._log_strategy_event(
+                f"[MADA] Disabled {strategy} strategy for "
+                f"{self.cooldown_length} offspring due to repeated failures."
+            )
+            self._push_guardrail_feedback()
 
     def ensure_blocks(self, solution: Solution) -> ParsedAlgorithm:
         """Parse and cache block metadata for ``solution``."""
@@ -171,6 +284,12 @@ class MADAOperator:
     ) -> OffspringProposal:
         parsed_alpha = self.ensure_blocks(alpha)
         parsed_beta = self.ensure_blocks(beta)
+        ratio_alpha = self._block_placeholder_ratio(parsed_alpha)
+        if ratio_alpha >= self.placeholder_block_threshold:
+            raise PlaceholderAbort(alpha, ratio_alpha)
+        ratio_beta = self._block_placeholder_ratio(parsed_beta)
+        if ratio_beta >= self.placeholder_block_threshold:
+            raise PlaceholderAbort(beta, ratio_beta)
         overrides: Dict[str, str] = {}
         decisions: List[Dict[str, object]] = []
         parent_ids = set()
@@ -249,6 +368,8 @@ class MADAOperator:
         decisions: List[Dict[str, object]] = []
         parent_ids = {alpha.id, beta.id}
         helper_bundle = self._empty_helper_bundle()
+        fallback_blocks = 0
+        total_blocks = len(self.parser.target_blocks) or 1
 
         for block in self.parser.target_blocks:
             sampler = self.bandits[block]
@@ -257,6 +378,7 @@ class MADAOperator:
             reward_override = None
             parent_id = None
             source_hash = ""
+            fallback_to_alpha = False
 
             if arm == "alpha":
                 snippet = parsed_alpha.blocks[block]
@@ -275,6 +397,7 @@ class MADAOperator:
                     reward_override = 0.0
                     parent_id = alpha.id
                     source_hash = parsed_alpha.hashes[block]
+                    fallback_to_alpha = True
                 else:
                     parent_id = meta.get("parent_id")
                     source_hash = meta.get("hash", "")
@@ -313,12 +436,16 @@ class MADAOperator:
                     overrides[block] = snippet
                     decision["parent_id"] = alpha.id
                     decision["source_hash"] = parsed_alpha.hashes[block]
+                    fallback_to_alpha = True
                     if reward_override is None and arm == "innovation":
                         decision["reward_override"] = 0.0
             else:
                 overrides[block] = parsed_alpha.blocks[block]
+                fallback_to_alpha = True
 
             decisions.append(decision)
+            if fallback_to_alpha:
+                fallback_blocks += 1
 
         changed_blocks = sorted(
             decision["block"]
@@ -340,6 +467,11 @@ class MADAOperator:
             "parents": list(parent_ids),
             "population_context": population_summary,
         }
+        if fallback_blocks >= math.ceil(total_blocks / 2):
+            raise InnovationAbort(
+                alpha,
+                f"{fallback_blocks}/{total_blocks} blocks reverted to alpha",
+            )
         description = f"MADA innovation guided by bandits (α={alpha.name}, β={beta.name})"
         return OffspringProposal(
             code=code,
@@ -396,7 +528,11 @@ class MADAOperator:
             return None, {}
 
         cleaned = textwrap.dedent(snippet_code).strip()
+        cleaned, _ = self._repair_signature(block, cleaned)
         if not self._valid_block(cleaned, block):
+            return None, {}
+        if self._is_placeholder_snippet(cleaned):
+            self._record_violation(f"placeholder_snippet:{block}")
             return None, {}
 
         block_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
@@ -410,11 +546,15 @@ class MADAOperator:
             self._record_violation(f"invalid_block:{block}")
             return False
         try:
-            ast.parse(textwrap.dedent(snippet))
-            return True
+            module = ast.parse(textwrap.dedent(snippet))
         except SyntaxError:
             self._record_violation(f"invalid_block:{block}")
             return False
+        func_node = next((node for node in module.body if isinstance(node, ast.FunctionDef)), None)
+        if func_node is None or func_node.name != block:
+            self._record_violation(f"invalid_block:{block}")
+            return False
+        return self._signature_matches(func_node, block)
 
     # ------------------------------------------------------------------ #
     # Dependency + helper utilities
@@ -571,6 +711,20 @@ class MADAOperator:
                 pass
         self._record_violation("high_placeholder_ratio")
 
+    def _log_strategy_event(self, message: str) -> None:
+        logger = getattr(self.algorithm_manager, "logger", None)
+        if not (logger and hasattr(logger, "log_conversation")):
+            return
+        try:
+            logger.log_conversation("system", message)
+        except TypeError:
+            try:
+                logger.log_conversation(message)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _record_violation(self, reason: Optional[str]) -> None:
         if not reason:
             return
@@ -594,6 +748,9 @@ class MADAOperator:
             "missing_attributes": "missing __init__ attributes",
             "high_placeholder_ratio": "high placeholder ratio",
             "invalid_block": "invalid block syntax",
+            "innovation_disabled": "innovation cooldown",
+            "recombination_disabled": "recombination cooldown",
+            "legacy_disabled": "legacy cooldown",
         }
         return mapping.get(key, key.replace("_", " "))
 
@@ -623,14 +780,94 @@ class MADAOperator:
     # ------------------------------------------------------------------ #
     # Misc helpers
     # ------------------------------------------------------------------ #
+    def _build_expected_signatures(self) -> tuple[Dict[str, str], Dict[str, List[str]]]:
+        headers: Dict[str, str] = {}
+        args_map: Dict[str, List[str]] = {}
+        for block, template in PLACEHOLDER_SIGNATURES.items():
+            dedented = textwrap.dedent(template).strip()
+            lines = dedented.splitlines()
+            if not lines:
+                continue
+            headers[block] = lines[0].strip()
+            try:
+                node = ast.parse(dedented).body[0]
+                if isinstance(node, ast.FunctionDef):
+                    args_map[block] = [arg.arg for arg in node.args.args]
+                else:
+                    args_map[block] = []
+            except SyntaxError:
+                args_map[block] = []
+        return headers, args_map
+
+    def _repair_signature(self, block: str, snippet: str) -> tuple[str, bool]:
+        expected = self.expected_signature_headers.get(block)
+        if not expected:
+            return snippet, False
+        dedented = textwrap.dedent(snippet).splitlines()
+        if not dedented:
+            return snippet, False
+        current = dedented[0].strip()
+        normalized_expected = expected.strip()
+        if current == normalized_expected:
+            return snippet, False
+        dedented[0] = normalized_expected
+        repaired = "\n".join(dedented)
+        self._log_strategy_event(
+            f"[MADA] Auto-repaired signature for `{block}` to `{normalized_expected}`."
+        )
+        return repaired, True
+
+    def _is_placeholder_snippet(self, snippet: Optional[str]) -> bool:
+        if not snippet:
+            return True
+        return 'Placeholder generated by MADA' in snippet
+
+    def _block_placeholder_ratio(self, parsed: ParsedAlgorithm) -> float:
+        total = len(self.parser.target_blocks) or 1
+        placeholder_blocks = 0
+        for block in self.parser.target_blocks:
+            snippet = parsed.blocks.get(block, "")
+            if self._is_placeholder_snippet(snippet):
+                placeholder_blocks += 1
+        return placeholder_blocks / total
+
+    def _signature_matches(self, func_node: ast.FunctionDef, block: str) -> bool:
+        expected = self.expected_signature_args.get(block)
+        if not expected:
+            return True
+        actual = [arg.arg for arg in func_node.args.args]
+        if actual == expected:
+            return True
+        self._record_violation(f"invalid_signature:{block}")
+        return False
+
+    def _tick_strategy_cooldowns(self) -> None:
+        for strategy, remaining in list(self.strategy_cooldowns.items()):
+            if remaining > 0:
+                self.strategy_cooldowns[strategy] = remaining - 1
+
+    def _active_strategy_weights(self) -> Dict[str, float]:
+        active = {
+            strategy: weight
+            for strategy, weight in self.strategy_weights.items()
+            if self.strategy_cooldowns.get(strategy, 0) == 0
+        }
+        if not active:
+            return self.strategy_weights
+        total = sum(active.values())
+        if total <= 0:
+            return self.strategy_weights
+        return {strategy: weight / total for strategy, weight in active.items()}
+
     def _sample_strategy(self) -> str:
+        weights = self._active_strategy_weights()
         roll = self.random.random()
         cumulative = 0.0
-        for strategy, weight in self.strategy_weights.items():
+        for strategy, weight in weights.items():
             cumulative += weight
             if roll <= cumulative:
                 return strategy
-        return "innovation"
+        return next(iter(weights.keys()), "innovation")
 
     def _child_name(
         self, base: str, strategy: str, changed_blocks: Optional[List[str]] = None

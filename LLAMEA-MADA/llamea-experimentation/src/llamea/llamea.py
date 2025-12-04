@@ -523,6 +523,35 @@ With code:
 
         def _select_unique(population):
             """Helper: select best parents preferring distinct code and fitness when possible."""
+            def _family_key(individual):
+                lineage = None
+                getter = getattr(individual, "get_lineage", None)
+                if callable(getter):
+                    lineage = getter()
+                elif hasattr(individual, "metadata"):
+                    lineage = individual.metadata.get("mada_lineage")
+                if isinstance(lineage, dict):
+                    family_id = lineage.get("family_id")
+                    if family_id:
+                        return f"family:{family_id}"
+                    parents = lineage.get("parents")
+                    if parents:
+                        return "parents:" + "-".join(sorted(parents))
+                    strategy = lineage.get("strategy")
+                    if strategy:
+                        return f"strategy:{strategy}"
+                operator = getattr(individual, "operator", None)
+                if operator:
+                    return f"operator:{operator}"
+                description = getattr(individual, "description", None)
+                if description:
+                    return f"description:{description}"
+                return getattr(individual, "name", "") or getattr(individual, "id", "")
+
+            def _fitness_close(a, b, rel_tol=1e-4):
+                scale = max(1.0, abs(a), abs(b))
+                return abs(a - b) <= rel_tol * scale
+
             sorted_pop = sorted(population, key=lambda x: x.fitness, reverse=reverse)
             if not sorted_pop:
                 return []
@@ -536,6 +565,7 @@ With code:
 
             best_fitness = best.fitness
             best_code = best.code or ""
+            best_family = _family_key(best)
 
             # Prefer a second parent that is both code-distinct and strictly worse in fitness.
             second = None
@@ -561,19 +591,55 @@ With code:
                 second = sorted_pop[1]
 
             if second is not None:
+                if _fitness_close(second.fitness, best_fitness) and _family_key(second) == best_family:
+                    alternate = next(
+                        (
+                            ind
+                            for ind in sorted_pop[1:]
+                            if ind is not second
+                            and _fitness_close(ind.fitness, best_fitness)
+                            and _family_key(ind) != best_family
+                        ),
+                        None,
+                    )
+                    if alternate is not None:
+                        second = alternate
+
+            if second is not None:
                 selected.append(second)
 
             # If more parents are requested, fill remaining slots with next best,
             # avoiding exact code duplicates when possible.
-            seen_codes = {best_code, second.code or "" if second is not None else ""}
+            seen_codes = {best_code}
+            if second is not None:
+                seen_codes.add(second.code or "")
+            seen_families = {best_family}
+            if second is not None:
+                seen_families.add(_family_key(second))
+            deferred = []
             for ind in sorted_pop[2:]:
                 if len(selected) >= self.n_parents:
                     break
                 code_key = ind.code or ""
                 if code_key in seen_codes:
                     continue
+                family = _family_key(ind)
+                if _fitness_close(ind.fitness, best_fitness) and family in seen_families:
+                    deferred.append(ind)
+                    continue
                 seen_codes.add(code_key)
+                seen_families.add(family)
                 selected.append(ind)
+
+            if len(selected) < self.n_parents:
+                for ind in deferred:
+                    if len(selected) >= self.n_parents:
+                        break
+                    code_key = ind.code or ""
+                    if code_key in seen_codes:
+                        continue
+                    seen_codes.add(code_key)
+                    selected.append(ind)
 
             if len(selected) < self.n_parents:
                 for ind in sorted_pop:
