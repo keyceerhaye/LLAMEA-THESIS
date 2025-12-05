@@ -9,8 +9,15 @@ SRC_DIR = os.path.abspath(os.path.join(TESTS_DIR, "..", "src"))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from llamea.mada.operator import MADAOperator  # noqa: E402
+from llamea.mada.operator import (  # noqa: E402
+    MADAOperator,
+    InvalidBlockSnippet,
+)
 from llamea.mada.parser import BlockParser  # noqa: E402
+from llamea.mada.ast_utils import (  # noqa: E402
+    detect_population_contract_issues,
+    find_undefined_names,
+)
 
 
 class _DummyManager:
@@ -213,6 +220,88 @@ class DependencyVerificationTests(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertTrue(reason.startswith("missing_helper"))
+
+
+class SignatureRepairTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.parser = BlockParser()
+        self.operator = MADAOperator(algorithm_manager=_DummyManager(), parser=self.parser)
+
+    def test_repair_signature_preserves_annotations(self):
+        snippet = textwrap.dedent(
+            """
+            def parent_selection(self, pop: list[tuple[list[float], float]]) -> list[tuple[list[float], float]]:
+                return pop
+            """
+        ).strip()
+
+        repaired, changed = self.operator._repair_signature("parent_selection", snippet)
+
+        self.assertTrue(changed, msg="Expected repair to rename parameter")
+        header = repaired.splitlines()[0]
+        self.assertIn("population: list[tuple[list[float], float]]", header)
+        self.assertIn("-> list[tuple[list[float], float]]", header)
+        self.assertNotIn("pop:", header)
+
+    def test_missing_signature_wraps_with_canonical_header(self):
+        snippet = textwrap.dedent(
+            """
+            ranked = sorted(population, key=lambda item: item[1])
+            return ranked[:2]
+            """
+        ).strip()
+
+        repaired, changed = self.operator._repair_signature("parent_selection", snippet)
+
+        self.assertTrue(changed)
+        header = repaired.splitlines()[0].strip()
+        expected_header = self.operator.expected_signature_headers["parent_selection"]
+        self.assertEqual(header, expected_header)
+        self.assertIn("ranked = sorted", repaired)
+
+
+class SnippetValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.operator = MADAOperator(algorithm_manager=_DummyManager(), parser=BlockParser())
+
+    def test_find_undefined_names_detects_bare_identifier(self):
+        snippet = """
+def demo(self):
+    return popsize
+"""
+        undefined = find_undefined_names(snippet)
+        self.assertIn("popsize", undefined)
+
+    def test_operator_rejects_block_with_undefined_identifier(self):
+        snippet = """
+def parent_selection(self, population):
+    return popsize
+"""
+        with self.assertRaises(InvalidBlockSnippet):
+            self.operator._validate_block_semantics("parent_selection", snippet)
+
+    def test_detect_population_tuple_call_issue(self):
+        snippet = """
+def mutation(self, candidate):
+    return func((candidate, fitness))
+"""
+        issues = detect_population_contract_issues(snippet)
+        self.assertTrue(
+            any(issue.startswith("tuple_call:mutation") for issue in issues),
+            msg=f"Expected tuple_call issue, got {issues}",
+        )
+
+    def test_detect_missing_destructuring_issue(self):
+        snippet = """
+def survivor_selection(self, population, offspring):
+    for item in population:
+        return population
+"""
+        issues = detect_population_contract_issues(snippet)
+        self.assertTrue(
+            any("missing_destructuring:survivor_selection:population" in issue for issue in issues),
+            msg=f"Expected destructuring issue, got {issues}",
+        )
 
 
 if __name__ == "__main__":

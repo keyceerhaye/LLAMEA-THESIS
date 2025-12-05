@@ -16,11 +16,64 @@ import numpy as np
 from ..solution import Solution
 from .ds_ts import DiscountedThompsonSampler
 from .parser import BlockParser, ParsedAlgorithm, PLACEHOLDER_SIGNATURES
+from .ast_utils import (
+    default_allowed_names,
+    detect_population_contract_issues,
+    find_undefined_names,
+)
 
 PROMPT_GUARDRAILS = [
     "- Keep shared state updates inside helper methods or __init__; do not introduce module-level globals.",
     "- If the block depends on helpers such as update_archive(), call them instead of duplicating logic.",
 ]
+
+CANONICAL_HELPERS = {
+    "_normalize_population": textwrap.dedent(
+        """
+        def _normalize_population(self, records):
+            if not records:
+                return []
+            normalized = []
+            for candidate, fitness in self._iter_population(records):
+                normalized.append((candidate, fitness))
+            return normalized
+        """
+    ).strip(),
+    "_iter_population": textwrap.dedent(
+        """
+        def _iter_population(self, records):
+            if not records:
+                return
+            for entry in records:
+                if entry is None:
+                    continue
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    candidate, fitness = entry
+                elif isinstance(entry, list) and len(entry) == 2:
+                    candidate, fitness = entry
+                elif isinstance(entry, dict):
+                    candidate = entry.get("candidate")
+                    fitness = entry.get("fitness")
+                else:
+                    continue
+                if candidate is None or fitness is None:
+                    continue
+                yield np.array(candidate, copy=True), float(fitness)
+        """
+    ).strip(),
+    "_ensure_tuple_records": textwrap.dedent(
+        """
+        def _ensure_tuple_records(self, records):
+            normalized = self._normalize_population(records)
+            if not normalized:
+                return []
+            return [
+                (np.array(candidate, copy=True), float(fitness))
+                for candidate, fitness in normalized
+            ]
+        """
+    ).strip(),
+}
 
 
 @dataclass
@@ -56,6 +109,15 @@ class InnovationAbort(Exception):
         self.parent = parent
         self.reason = reason
         super().__init__(reason)
+
+
+class InvalidBlockSnippet(RuntimeError):
+    """Raised when a generated block references undefined identifiers."""
+
+    def __init__(self, block: str, reason: str):
+        self.block = block
+        self.reason = reason
+        super().__init__(f"{block}: {reason}")
 
 
 class MADAOperator:
@@ -98,13 +160,17 @@ class MADAOperator:
         self.failure_threshold = 2
         self.cooldown_length = 5
         self.child_counter = 0
-        self.placeholder_threshold = 0.5
+        self.placeholder_threshold = 0.3
         self.placeholder_block_threshold = 0.3
         self.guardrail_window = guardrail_window
         self._violation_history: Deque[str] = deque(maxlen=guardrail_window)
+        self.cooldown_events: List[Dict[str, object]] = []
+        self.allowed_identifier_names = default_allowed_names()
         (
             self.expected_signature_headers,
             self.expected_signature_args,
+            self.expected_signature_arg_annotations,
+            self.expected_signature_returns,
         ) = self._build_expected_signatures()
 
     # ------------------------------------------------------------------ #
@@ -172,6 +238,15 @@ class MADAOperator:
                 reward_override=decision.get("reward_override"),
             )
 
+    def export_bandit_snapshot(self) -> Dict[str, Dict[str, Dict[str, float]]]:
+        """Return the current DS-TS state for monitoring."""
+
+        snapshot: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for block, sampler in self.bandits.items():
+            snapshot[block] = sampler.get_state_snapshot(block)
+        snapshot["_strategy_weights"] = dict(self.strategy_weights)
+        return snapshot
+
     def boost_exploration(self, duration: int = 3) -> None:
         """Temporarily bias sampling toward exploration-heavy weights."""
 
@@ -229,6 +304,13 @@ class MADAOperator:
                 f"[MADA] Disabled {strategy} strategy for "
                 f"{self.cooldown_length} offspring due to repeated failures."
             )
+            self.cooldown_events.append(
+                {
+                    "strategy": strategy,
+                    "cooldown": self.cooldown_length,
+                    "error": (error or "").splitlines()[0] if error else "",
+                }
+            )
             self._push_guardrail_feedback()
 
     def ensure_blocks(self, solution: Solution) -> ParsedAlgorithm:
@@ -285,10 +367,10 @@ class MADAOperator:
         parsed_alpha = self.ensure_blocks(alpha)
         parsed_beta = self.ensure_blocks(beta)
         ratio_alpha = self._block_placeholder_ratio(parsed_alpha)
-        if ratio_alpha >= self.placeholder_block_threshold:
+        if ratio_alpha >= self.placeholder_block_threshold and not self._has_min_real_blocks(parsed_alpha, 2):
             raise PlaceholderAbort(alpha, ratio_alpha)
         ratio_beta = self._block_placeholder_ratio(parsed_beta)
-        if ratio_beta >= self.placeholder_block_threshold:
+        if ratio_beta >= self.placeholder_block_threshold and not self._has_min_real_blocks(parsed_beta, 2):
             raise PlaceholderAbort(beta, ratio_beta)
         overrides: Dict[str, str] = {}
         decisions: List[Dict[str, object]] = []
@@ -300,6 +382,7 @@ class MADAOperator:
                 [("alpha", parsed_alpha, alpha), ("beta", parsed_beta, beta)]
             )
             snippet = parsed.blocks[block]
+            snippet = self._enforce_survivor_contract(block, snippet)
             decision = {
                 "block": block,
                 "arm": f"recomb_{donor_label}",
@@ -319,9 +402,12 @@ class MADAOperator:
             )
             if success:
                 helper_bundle = updated_bundle
-                overrides[block] = snippet
+                overrides[block] = self._enforce_survivor_contract(block, snippet)
             else:
-                overrides[block] = parsed_alpha.blocks[block]
+                fallback_snippet = parsed_alpha.blocks[block]
+                overrides[block] = self._enforce_survivor_contract(
+                    block, fallback_snippet
+                )
                 decision["dependency_issue"] = reason
                 self._record_violation(reason)
                 decision["parent_id"] = alpha.id
@@ -369,6 +455,7 @@ class MADAOperator:
         parent_ids = {alpha.id, beta.id}
         helper_bundle = self._empty_helper_bundle()
         fallback_blocks = 0
+        dependency_fallbacks = 0
         total_blocks = len(self.parser.target_blocks) or 1
 
         for block in self.parser.target_blocks:
@@ -428,24 +515,35 @@ class MADAOperator:
                 )
                 if success:
                     helper_bundle = updated_bundle
-                    overrides[block] = snippet
+                    overrides[block] = self._enforce_survivor_contract(block, snippet)
                 else:
+                    dependency_fallbacks += 1
                     decision["dependency_issue"] = reason
                     self._record_violation(reason)
                     snippet = parsed_alpha.blocks[block]
-                    overrides[block] = snippet
+                    overrides[block] = self._enforce_survivor_contract(
+                        block, snippet
+                    )
                     decision["parent_id"] = alpha.id
                     decision["source_hash"] = parsed_alpha.hashes[block]
                     fallback_to_alpha = True
                     if reward_override is None and arm == "innovation":
                         decision["reward_override"] = 0.0
             else:
-                overrides[block] = parsed_alpha.blocks[block]
+                overrides[block] = self._enforce_survivor_contract(
+                    block, parsed_alpha.blocks[block]
+                )
                 fallback_to_alpha = True
 
             decisions.append(decision)
             if fallback_to_alpha:
                 fallback_blocks += 1
+
+        if dependency_fallbacks > 2:
+            raise InnovationAbort(
+                alpha,
+                f"dependency fallbacks for {dependency_fallbacks} blocks",
+            )
 
         changed_blocks = sorted(
             decision["block"]
@@ -467,10 +565,14 @@ class MADAOperator:
             "parents": list(parent_ids),
             "population_context": population_summary,
         }
+        lineage["diagnostics"] = {
+            "fallback_blocks": fallback_blocks,
+            "total_blocks": total_blocks,
+        }
         if fallback_blocks >= math.ceil(total_blocks / 2):
-            raise InnovationAbort(
-                alpha,
-                f"{fallback_blocks}/{total_blocks} blocks reverted to alpha",
+            self._log_strategy_event(
+                f"[MADA] Innovation reused alpha for "
+                f"{fallback_blocks}/{total_blocks} blocks."
             )
         description = f"MADA innovation guided by bandits (α={alpha.name}, β={beta.name})"
         return OffspringProposal(
@@ -480,6 +582,7 @@ class MADAOperator:
             lineage=lineage,
             strategy="innovation",
             parent_ids=list(parent_ids),
+            diagnostics={"fallback_blocks": fallback_blocks, "total_blocks": total_blocks},
         )
 
     # ------------------------------------------------------------------ #
@@ -497,14 +600,25 @@ class MADAOperator:
         baseline = template.blocks[block]
         signature = baseline.splitlines()[0] if baseline else f"def {block}(self, *args, **kwargs):"
         helper_context = self._format_helper_context(template, block)
+        coverage_summary = self._format_coverage_summary(template)
         guardrail_text = self._format_guardrail_block()
         guardrail_section = f"\n{guardrail_text}\n" if guardrail_text else ""
+        requirements = textwrap.dedent(
+            f"""
+            Requirements:
+            - Keep the exact signature `{signature}` and match the existing indentation.
+            - Use or extend the helper methods and attributes listed below; do not remove them.
+            - Introduce new helpers only if necessary, define them inside the optimizer class, and ensure `__init__` wires any new attributes.
+            - Return ONLY the updated method definition enclosed in a ```python``` block.
+            """
+        ).strip()
         prompt = textwrap.dedent(
             f"""
             The current population summary is:\n{population_summary}\n
+            Template coverage for `{template.class_name}`: {coverage_summary}.
             Improve the `{block}` method of the optimizer class `{template.class_name}`.
-            Use the exact signature `{signature}` and return only the method definition
-            inside a Python code block. Keep helper references consistent with the class.
+
+            {requirements}
 
             Helper/context for `{block}`:
             {helper_context}
@@ -531,10 +645,19 @@ class MADAOperator:
         cleaned, _ = self._repair_signature(block, cleaned)
         if not self._valid_block(cleaned, block):
             return None, {}
+        try:
+            self._validate_block_semantics(block, cleaned)
+        except InvalidBlockSnippet as exc:
+            self._record_violation("invalid_identifier")
+            self._log_strategy_event(
+                f"[MADA] Rejected {block} snippet: {exc.reason}."
+            )
+            return None, {}
         if self._is_placeholder_snippet(cleaned):
             self._record_violation(f"placeholder_snippet:{block}")
             return None, {}
 
+        cleaned = self._enforce_survivor_contract(block, cleaned)
         block_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
         return cleaned, {"hash": block_hash, "parent_id": "innovation"}
 
@@ -565,14 +688,39 @@ class MADAOperator:
         attributes = sorted(list(bundle.get("attributes", [])))
         lines = []
         if helpers:
-            lines.append(f"Available helper methods: {', '.join(helpers)}")
+            lines.append(f"- Helper methods already defined: {', '.join(helpers)}")
         else:
-            lines.append("Available helper methods: none detected; reuse shared helpers only.")
+            lines.append("- Helper methods already defined: none detected; reuse shared helpers only.")
         if attributes:
-            lines.append(f"Shared attributes referenced: {', '.join(attributes)}")
+            lines.append(f"- __init__ attributes referenced: {', '.join(attributes)}")
         else:
-            lines.append("Shared attributes referenced: none beyond default state.")
+            lines.append("- __init__ attributes referenced: none beyond default state.")
         return "\n".join(lines)
+
+    def _has_min_real_blocks(
+        self, parsed: ParsedAlgorithm, min_blocks: int
+    ) -> bool:
+        count = 0
+        for block in self.parser.target_blocks:
+            snippet = parsed.blocks.get(block, "")
+            if not self._is_placeholder_snippet(snippet):
+                count += 1
+            if count >= min_blocks:
+                return True
+        return False
+
+    def _format_coverage_summary(self, template: ParsedAlgorithm) -> str:
+        coverage = template.coverage or {}
+        total = coverage.get("total_blocks") or len(self.parser.target_blocks) or 1
+        real_blocks = coverage.get("real_blocks")
+        if real_blocks is None:
+            placeholder = coverage.get("placeholder_blocks")
+            if placeholder is not None:
+                real_blocks = total - placeholder
+            else:
+                real_blocks = 0
+        ratio = coverage.get("placeholder_ratio", 0.0)
+        return f"{real_blocks}/{total} real blocks (placeholder ratio {ratio:.2f})"
 
     def _empty_helper_bundle(self) -> Dict[str, Dict[str, str]]:
         return {"methods": {}, "init_assignments": {}}
@@ -658,12 +806,27 @@ class MADAOperator:
         self, parsed: Optional[ParsedAlgorithm], helper_name: str
     ) -> Optional[str]:
         if parsed is None:
-            return None
+            return CANONICAL_HELPERS.get(helper_name)
         if helper_name in parsed.other_methods:
             return parsed.other_methods[helper_name]
         if helper_name in parsed.blocks:
             return parsed.blocks[helper_name]
-        return None
+        return CANONICAL_HELPERS.get(helper_name)
+
+    def _enforce_survivor_contract(self, block: str, snippet: str) -> str:
+        if block != "survivor_selection":
+            return snippet
+        try:
+            tree = ast.parse(textwrap.dedent(snippet))
+        except SyntaxError:
+            return snippet
+        wrapper = _SurvivorReturnWrapper()
+        transformed = wrapper.visit(tree)
+        ast.fix_missing_locations(transformed)
+        try:
+            return ast.unparse(transformed)
+        except Exception:
+            return snippet
 
     def _resolve_attribute_assignments(
         self, attributes: List[str], donor_parsed: Optional[ParsedAlgorithm]
@@ -710,6 +873,7 @@ class MADAOperator:
             except Exception:
                 pass
         self._record_violation("high_placeholder_ratio")
+        self._push_guardrail_feedback()
 
     def _log_strategy_event(self, message: str) -> None:
         logger = getattr(self.algorithm_manager, "logger", None)
@@ -780,9 +944,18 @@ class MADAOperator:
     # ------------------------------------------------------------------ #
     # Misc helpers
     # ------------------------------------------------------------------ #
-    def _build_expected_signatures(self) -> tuple[Dict[str, str], Dict[str, List[str]]]:
+    def _build_expected_signatures(
+        self,
+    ) -> tuple[
+        Dict[str, str],
+        Dict[str, List[str]],
+        Dict[str, List[Optional[str]]],
+        Dict[str, Optional[str]],
+    ]:
         headers: Dict[str, str] = {}
         args_map: Dict[str, List[str]] = {}
+        annotation_map: Dict[str, List[Optional[str]]] = {}
+        return_map: Dict[str, Optional[str]] = {}
         for block, template in PLACEHOLDER_SIGNATURES.items():
             dedented = textwrap.dedent(template).strip()
             lines = dedented.splitlines()
@@ -793,29 +966,131 @@ class MADAOperator:
                 node = ast.parse(dedented).body[0]
                 if isinstance(node, ast.FunctionDef):
                     args_map[block] = [arg.arg for arg in node.args.args]
+                    annotation_map[block] = [
+                        ast.unparse(arg.annotation) if arg.annotation else None
+                        for arg in node.args.args
+                    ]
+                    return_map[block] = (
+                        ast.unparse(node.returns) if node.returns else None
+                    )
                 else:
                     args_map[block] = []
+                    annotation_map[block] = []
+                    return_map[block] = None
             except SyntaxError:
                 args_map[block] = []
-        return headers, args_map
+                annotation_map[block] = []
+                return_map[block] = None
+        return headers, args_map, annotation_map, return_map
 
     def _repair_signature(self, block: str, snippet: str) -> tuple[str, bool]:
-        expected = self.expected_signature_headers.get(block)
-        if not expected:
+        expected_args = self.expected_signature_args.get(block, [])
+        annotation_specs = self.expected_signature_arg_annotations.get(block, [])
+        dedented = textwrap.dedent(snippet)
+        normalized = dedented.lstrip()
+
+        if not normalized.startswith("def "):
+            rebuilt = self._wrap_with_canonical_signature(block, dedented)
+            if rebuilt:
+                self._log_signature_fix(block, rebuilt)
+                return rebuilt, True
             return snippet, False
-        dedented = textwrap.dedent(snippet).splitlines()
-        if not dedented:
+
+        changed = False
+        try:
+            module = ast.parse(dedented)
+            func_node = next(
+                (node for node in module.body if isinstance(node, ast.FunctionDef)), None
+            )
+        except SyntaxError:
+            func_node = None
+
+        if func_node is None:
+            rebuilt = self._wrap_with_canonical_signature(block, dedented)
+            if rebuilt:
+                self._log_signature_fix(block, rebuilt)
+                return rebuilt, True
             return snippet, False
-        current = dedented[0].strip()
-        normalized_expected = expected.strip()
-        if current == normalized_expected:
-            return snippet, False
-        dedented[0] = normalized_expected
-        repaired = "\n".join(dedented)
+
+        if func_node.name != block:
+            func_node.name = block
+            changed = True
+
+        if expected_args:
+            arg_nodes = func_node.args.args
+            annotations = list(annotation_specs) + [None] * max(
+                0, len(expected_args) - len(annotation_specs)
+            )
+            mapping: Dict[str, str] = {}
+            for idx, expected_arg in enumerate(expected_args):
+                if idx < len(arg_nodes):
+                    arg_node = arg_nodes[idx]
+                    if arg_node.arg != expected_arg:
+                        mapping[arg_node.arg] = expected_arg
+                        arg_node.arg = expected_arg
+                        changed = True
+                else:
+                    annotation_src = annotations[idx]
+                    arg_nodes.append(
+                        ast.arg(
+                            arg=expected_arg,
+                            annotation=self._annotation_from_source(annotation_src),
+                        )
+                    )
+                    changed = True
+            if mapping:
+                _ParamNameRewriter(mapping).visit(func_node)
+
+        if changed:
+            repaired = ast.unparse(func_node)
+            self._log_signature_fix(block, repaired)
+            return repaired, True
+
+        return snippet, False
+
+    def _wrap_with_canonical_signature(self, block: str, body: str) -> Optional[str]:
+        header = self.expected_signature_headers.get(block)
+        if not header:
+            return None
+        stripped = textwrap.dedent(body).strip("\n")
+        if stripped.lstrip().startswith("def "):
+            return PLACEHOLDER_SIGNATURES.get(block)
+        payload = stripped if stripped.strip() else "pass"
+        indented = textwrap.indent(payload, "    ")
+        return f"{header}\n{indented}"
+
+    def _validate_block_semantics(self, block: str, snippet: str) -> None:
+        """Ensure the snippet does not reference undefined identifiers."""
+
+        undefined = find_undefined_names(snippet, self.allowed_identifier_names)
+        if undefined:
+            reason = f"undefined_identifiers:{','.join(sorted(undefined))}"
+            raise InvalidBlockSnippet(block, reason)
+
+        issues = detect_population_contract_issues(snippet)
+        block_issues = []
+        for issue in issues:
+            parts = issue.split(":")
+            if len(parts) >= 2 and parts[1] == block:
+                block_issues.append(issue)
+        if block_issues:
+            raise InvalidBlockSnippet(block, ";".join(block_issues))
+
+    def _annotation_from_source(self, source: Optional[str]) -> Optional[ast.expr]:
+        if not source:
+            return None
+        try:
+            parsed = ast.parse(source, mode="eval")
+            return parsed.body
+        except SyntaxError:
+            return None
+
+    def _log_signature_fix(self, block: str, snippet: str) -> None:
+        lines = snippet.splitlines()
+        header = lines[0].strip() if lines else block
         self._log_strategy_event(
-            f"[MADA] Auto-repaired signature for `{block}` to `{normalized_expected}`."
+            f"[MADA] Auto-repaired signature for `{block}` to `{header}`."
         )
-        return repaired, True
 
     def _is_placeholder_snippet(self, snippet: Optional[str]) -> bool:
         if not snippet:
@@ -939,3 +1214,44 @@ class _SnippetDependencyVisitor(ast.NodeVisitor):
         if isinstance(node.value, ast.Name) and node.value.id == "self":
             self.attributes.add(node.attr)
         self.generic_visit(node)
+
+
+class _ParamNameRewriter(ast.NodeTransformer):
+    """Rename references to outdated parameter names inside snippets."""
+
+    def __init__(self, mapping: Dict[str, str]):
+        super().__init__()
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in self.mapping:
+            node.id = self.mapping[node.id]
+        return self.generic_visit(node)
+
+
+class _SurvivorReturnWrapper(ast.NodeTransformer):
+    """Wrap survivor_selection returns with `_ensure_tuple_records`."""
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        node = self.generic_visit(node)
+        if isinstance(node.value, ast.Call) and self._is_helper_call(node.value):
+            return node
+        value = node.value or ast.List(elts=[], ctx=ast.Load())
+        helper_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr="_ensure_tuple_records",
+                ctx=ast.Load(),
+            ),
+            args=[value],
+            keywords=[],
+        )
+        node.value = helper_call
+        return node
+
+    @staticmethod
+    def _is_helper_call(call: ast.Call) -> bool:
+        func = call.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return func.value.id == "self" and func.attr == "_ensure_tuple_records"
+        return False

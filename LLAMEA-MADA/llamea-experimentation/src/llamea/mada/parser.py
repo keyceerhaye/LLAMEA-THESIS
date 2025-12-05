@@ -8,12 +8,26 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+POPULATION_TYPE = "list[tuple[list[float], float]]"
+VECTOR_TYPE = "list[float]"
+
 PLACEHOLDER_SIGNATURES = {
-    "parent_selection": "def parent_selection(self, population):\n        return population",
-    "recombination": "def recombination(self, parents):\n        return parents[0]",
-    "mutation": "def mutation(self, candidate):\n        return candidate",
+    "parent_selection": (
+        f"def parent_selection(self, population: {POPULATION_TYPE}) -> {POPULATION_TYPE}:\n"
+        "        return population"
+    ),
+    "recombination": (
+        f"def recombination(self, parents: {POPULATION_TYPE}) -> {VECTOR_TYPE}:\n"
+        "        return parents[0][0] if parents else []"
+    ),
+    "mutation": (
+        f"def mutation(self, candidate: {VECTOR_TYPE}) -> {VECTOR_TYPE}:\n"
+        "        return candidate"
+    ),
     "survivor_selection": (
-        "def survivor_selection(self, population, offspring):\n        return population"
+        f"def survivor_selection(self, population: {POPULATION_TYPE}, offspring: {POPULATION_TYPE})"
+        f" -> {POPULATION_TYPE}:\n"
+        "        return population"
     ),
 }
 
