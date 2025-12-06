@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import random
+import re
 import textwrap
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -67,6 +68,11 @@ class MADAOperator:
         self.placeholder_threshold = 0.5
         self.guardrail_window = guardrail_window
         self._violation_history: Deque[str] = deque(maxlen=guardrail_window)
+        self._success_history: Dict[str, Deque[int]] = {
+            "innovation": deque(maxlen=50),
+            "recombination": deque(maxlen=50),
+            "legacy": deque(maxlen=50),
+        }
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -76,6 +82,7 @@ class MADAOperator:
         parents: Sequence[Solution],
         focal_parent: Optional[Solution] = None,
         population_summary: str = "",
+        archive: Optional[Sequence[Solution]] = None,
     ) -> OffspringProposal:
         """Return code + lineage for a new offspring according to the plan."""
 
@@ -84,7 +91,7 @@ class MADAOperator:
 
         ordered = sorted(parents, key=lambda sol: sol.fitness, reverse=True)
         alpha = ordered[0]
-        beta = ordered[1] if len(ordered) > 1 else ordered[0]
+        beta = self._pick_diverse_partner(alpha, ordered, archive)
         focal = focal_parent or self.random.choice(ordered)
         strategy = self._sample_strategy()
 
@@ -373,6 +380,10 @@ class MADAOperator:
             Improve the `{block}` method of the optimizer class `{template.class_name}`.
             Use the exact signature `{signature}` and return only the method definition
             inside a Python code block. Keep helper references consistent with the class.
+            Mandatory: call select_parents -> recombine -> mutate -> survivor_selection
+            in the main loop; recombination must use >=2 parents and change the genotype;
+            clip/reflect to bounds after recombination and mutation; avoid placeholders/TODO/pass-through.
+            Add a short inline comment on why the operator aids exploration vs exploitation.
 
             Helper/context for `{block}`:
             {helper_context}
@@ -407,6 +418,16 @@ class MADAOperator:
             self._record_violation(f"invalid_block:{block}")
             return False
         if not snippet.split("(")[0].endswith(block):
+            self._record_violation(f"invalid_block:{block}")
+            return False
+        lowered = snippet.lower()
+        if "placeholder" in lowered or "todo" in lowered:
+            self._record_violation(f"invalid_block:{block}")
+            return False
+        if re.search(r"\bpass\b", snippet):
+            self._record_violation(f"invalid_block:{block}")
+            return False
+        if "return parents[0]" in lowered or "return parents" in lowered:
             self._record_violation(f"invalid_block:{block}")
             return False
         try:
@@ -632,6 +653,22 @@ class MADAOperator:
                 return strategy
         return "innovation"
 
+    def _pick_diverse_partner(
+        self,
+        alpha: Solution,
+        parents: Sequence[Solution],
+        archive: Optional[Sequence[Solution]] = None,
+    ) -> Solution:
+        """Choose a partner that contrasts alpha (prefer archive tail if present)."""
+        archive = list(archive) if archive else []
+        candidates = [p for p in parents if p.id != alpha.id]
+        pool = candidates + [a for a in archive if a.id != alpha.id]
+        if not pool:
+            return alpha
+        pool_sorted = sorted(pool, key=lambda sol: sol.fitness, reverse=True)
+        diverse = pool_sorted[-1] if len(pool_sorted) > 1 else pool_sorted[0]
+        return self.random.choice([pool_sorted[0], diverse])
+
     def _child_name(
         self, base: str, strategy: str, changed_blocks: Optional[List[str]] = None
     ) -> str:
@@ -650,6 +687,19 @@ class MADAOperator:
         if len(blocks) > 3:
             tag += "_more"
         return tag or "stable"
+
+    def record_outcome(self, strategy: str, reward: float) -> None:
+        """Track binary success per strategy for diagnostics."""
+        tracker = self._success_history.get(strategy)
+        if tracker is None:
+            return
+        tracker.append(1 if reward > 0 else 0)
+
+    def success_rate(self, strategy: str) -> float:
+        tracker = self._success_history.get(strategy)
+        if not tracker:
+            return 0.0
+        return float(sum(tracker) / len(tracker))
 
     def _extract_class_name(self, code: str, default: str) -> str:
         for line in code.splitlines():

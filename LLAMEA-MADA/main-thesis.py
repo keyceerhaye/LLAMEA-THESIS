@@ -18,6 +18,81 @@ from llamea.solution import Solution
 from llamea.mada import MADAOperator, BlockParser
 from llamea.utils import NoCodeException
 
+# A known-valid seed algorithm to bootstrap the population
+SEED_ALGORITHM_CODE = '''
+import numpy as np
+
+class SeedOptimizer:
+    """A baseline evolutionary optimizer that handles bounds correctly."""
+    
+    def __init__(self, budget):
+        self.budget = budget
+        self.f_opt = float('inf')
+        self.x_opt = None
+
+    def __call__(self, func):
+        lb = np.asarray(func.bounds.lb)
+        ub = np.asarray(func.bounds.ub)
+        dim = len(lb)
+        pop_size = max(10, min(self.budget // 10, 50))
+        
+        population = np.random.uniform(lb, ub, (pop_size, dim))
+        fitness = np.array([func(x) for x in population])
+        evals = pop_size
+        
+        best_idx = np.argmin(fitness)
+        self.f_opt = fitness[best_idx]
+        self.x_opt = population[best_idx].copy()
+        
+        while evals < self.budget:
+            parents = self.select_parents(population, fitness)
+            offspring = self.recombine(parents)
+            offspring = self.mutate(offspring, lb, ub)
+            offspring = np.clip(offspring, lb, ub)
+            
+            offspring_f = np.array([func(x) for x in offspring])
+            evals += len(offspring)
+            
+            population, fitness = self.survivor_selection(population, fitness, offspring, offspring_f)
+            
+            if fitness[0] < self.f_opt:
+                self.f_opt = fitness[0]
+                self.x_opt = population[0].copy()
+        
+        return self.f_opt, self.x_opt
+
+    def select_parents(self, population, fitness):
+        pop_size = len(population)
+        tournament_size = min(3, pop_size)
+        parents = []
+        for _ in range(pop_size):
+            idx = np.random.choice(pop_size, tournament_size, replace=True)
+            winner = idx[np.argmin(fitness[idx])]
+            parents.append(population[winner])
+        return np.array(parents)
+
+    def recombine(self, parents):
+        pop_size, dim = parents.shape
+        offspring = np.empty_like(parents)
+        for i in range(pop_size):
+            idx = np.random.choice(pop_size, 2, replace=True)
+            p1, p2 = parents[idx[0]], parents[idx[1]]
+            mask = np.random.rand(dim) < 0.5
+            offspring[i] = np.where(mask, p1, p2)
+        return offspring
+
+    def mutate(self, offspring, lb, ub):
+        mutation = np.random.normal(0, 0.1 * (ub - lb), offspring.shape)
+        mask = np.random.rand(*offspring.shape) < 0.1
+        return offspring + mutation * mask
+
+    def survivor_selection(self, population, fitness, offspring, offspring_f):
+        combined = np.vstack([population, offspring])
+        combined_f = np.concatenate([fitness, offspring_f])
+        indices = np.argsort(combined_f)[:len(population)]
+        return combined[indices], combined_f[indices]
+'''
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -44,6 +119,114 @@ def make_solution(code, class_name, description, generation, parent_ids=None):
     return solution
 
 
+def _auto_correct_bounds(code: str) -> str:
+    """
+    Attempt to auto-fix common bounds mistakes before validation.
+    Returns corrected code.
+    """
+    import re as _re
+    
+    # Fix: func.bounds.shape[1] -> len(np.asarray(func.bounds.lb))
+    code = _re.sub(
+        r'func\.bounds\.shape\[1\]',
+        'len(np.asarray(func.bounds.lb))',
+        code
+    )
+    code = _re.sub(
+        r'func\.bounds\.shape\[0\]',
+        '2',  # bounds always has 2 rows (lb, ub) in the old format
+        code
+    )
+    
+    # Fix: self.dim = func.bounds.shape[1] pattern
+    code = _re.sub(
+        r'self\.dim\s*=\s*func\.bounds\.shape\[1\]',
+        'self.dim = len(np.asarray(func.bounds.lb))',
+        code
+    )
+    
+    # Fix: self.lb, self.ub = func.bounds[0], func.bounds[1]
+    code = _re.sub(
+        r'self\.lb,\s*self\.ub\s*=\s*func\.bounds\[0\],\s*func\.bounds\[1\]',
+        'self.lb = np.asarray(func.bounds.lb)\n        self.ub = np.asarray(func.bounds.ub)',
+        code
+    )
+    
+    # Fix: lb, ub = func.bounds[0], func.bounds[1]
+    code = _re.sub(
+        r'(\s*)lb,\s*ub\s*=\s*func\.bounds\[0\],\s*func\.bounds\[1\]',
+        r'\1lb = np.asarray(func.bounds.lb)\n\1ub = np.asarray(func.bounds.ub)',
+        code
+    )
+    
+    # Fix: func.bounds[0] alone -> np.asarray(func.bounds.lb)
+    code = _re.sub(
+        r'func\.bounds\[0\]',
+        'np.asarray(func.bounds.lb)',
+        code
+    )
+    code = _re.sub(
+        r'func\.bounds\[1\]',
+        'np.asarray(func.bounds.ub)',
+        code
+    )
+    
+    # Fix tournament selection: ensure replace=True or min(k, len)
+    # This is a common error pattern
+    code = _re.sub(
+        r'np\.random\.choice\(len\(population\),\s*tournament_size,\s*replace=False\)',
+        'np.random.choice(len(population), min(tournament_size, len(population)), replace=True)',
+        code
+    )
+    code = _re.sub(
+        r'np\.random\.choice\(len\(self\.pop_x\),\s*tournament_size,\s*replace=False\)',
+        'np.random.choice(len(self.pop_x), min(tournament_size, len(self.pop_x)), replace=True)',
+        code
+    )
+    
+    return code
+
+
+def _static_validate_algorithm(code: str):
+    """
+    Lightweight static checks to reject obviously invalid algorithms before exec/preflight.
+
+    Returns:
+        (ok: bool, message: str)
+    """
+    # Check on original code (case-sensitive for accurate detection)
+    
+    # Disallow treating bounds as shape/2-D matrices
+    forbidden_bound_tokens = [
+        "func.bounds.shape",
+        "bounds.shape[",
+        "self.bounds[0]",
+        "self.bounds[1]",
+        "column_stack",
+        "np.column_stack",
+        ".reshape(-1,1)",
+        ".reshape(-1, 1)",
+        "(dim,1)",
+        "(dim, 1)",
+    ]
+    for tok in forbidden_bound_tokens:
+        if tok in code:
+            return False, f"StaticReject: forbidden bounds usage '{tok}'"
+
+    # Check for bounds[0]/bounds[1] but allow func.bounds.lb/ub
+    if "bounds[0]" in code or "bounds[1]" in code:
+        return False, "StaticReject: forbidden bounds usage 'bounds[0]/bounds[1]'"
+
+    # Disallow using func.bounds directly as an array without lb/ub
+    if "func.bounds" in code and "bounds.lb" not in code:
+        return False, "StaticReject: use func.bounds.lb/ub with np.asarray"
+
+    # Require __call__(self, func) signature presence (case-insensitive)
+    if "__call__(self, func)" not in code.lower():
+        return False, "StaticReject: missing __call__(self, func) signature"
+
+    return True, ""
+
 
 def evaluate_algorithm(algorithm_code, algorithm_name, eval_budget):
     """
@@ -58,6 +241,13 @@ def evaluate_algorithm(algorithm_code, algorithm_name, eval_budget):
         tuple: (aucs, detailed_aucs, error_message)
     """
     try:
+        # Auto-correct common LLM mistakes before validation
+        algorithm_code = _auto_correct_bounds(algorithm_code)
+        
+        ok, msg = _static_validate_algorithm(algorithm_code)
+        if not ok:
+            return [], [0, 0, 0, 0, 0], msg
+
         # Execute the algorithm code
         exec(algorithm_code, globals())
         
@@ -66,6 +256,33 @@ def evaluate_algorithm(algorithm_code, algorithm_name, eval_budget):
             return [], [0, 0, 0, 0, 0], f"Class {algorithm_name} not found"
         
         algorithm_class = globals()[algorithm_name]
+
+        # Preflight: catch shape/signature issues early on a simple dummy problem
+        class _DummyBounds:
+            def __init__(self, d=5):
+                self.lb = np.full(d, -5.0)
+                self.ub = np.full(d, 5.0)
+
+        class _DummyProblem:
+            def __init__(self, d=5):
+                self.bounds = _DummyBounds(d)
+                self.state = type("S", (), {"evaluations": 0})()
+            def __call__(self, x):
+                self.state.evaluations += 1
+                x = np.asarray(x)
+                return float(np.sum(x * x))
+            def reset(self):
+                self.state.evaluations = 0
+            def attach_logger(self, _):
+                pass
+
+        try:
+            pre_alg = algorithm_class(min(10, eval_budget))
+            pre_alg(_DummyProblem())
+        except TypeError as e:
+            return [], [0, 0, 0, 0, 0], f"SignatureError(preflight): {e}"
+        except Exception as e:
+            return [], [0, 0, 0, 0, 0], f"PreflightError: {e}"
         
         # Setup logging
         l2 = aoc_logger(eval_budget, upper=1e2, triggers=[logger.trigger.ALWAYS])
@@ -87,6 +304,15 @@ def evaluate_algorithm(algorithm_code, algorithm_name, eval_budget):
                         algorithm(problem)
                     except OverBudgetException:
                         pass
+                    except TypeError as e:
+                        # Commonly from wrong __init__ or __call__ signature
+                        return [], [0, 0, 0, 0, 0], f"SignatureError: {e}"
+                    except AttributeError as e:
+                        # Commonly from using func.bounds incorrectly (e.g., assuming .shape)
+                        return [], [0, 0, 0, 0, 0], f"AttributeError: {e}"
+                    except ValueError as e:
+                        # Often from shape/broadcast issues (e.g., bounds misuse)
+                        return [], [0, 0, 0, 0, 0], f"ValueError: {e}"
                     except Exception as e:
                         return [], [0, 0, 0, 0, 0], str(e)
                     
@@ -439,18 +665,58 @@ def run_evolutionary_mode(
     best_ever = None
     api_calls = 0
     generation = 0
+    archive = []
+
+    def _update_archive(current, candidates, size=10):
+        combined = {ind.id: ind for ind in current}
+        for cand in candidates:
+            if cand is None:
+                continue
+            combined[cand.id] = cand
+        sorted_list = sorted(
+            combined.values(), key=lambda s: getattr(s, "fitness", 0.0), reverse=True
+        )
+        return sorted_list[:size]
     
     # Phase 1: Initialize parent population
     print(f"\n{'='*60}")
     print(f"INITIALIZATION: Generating {n_parents} parent algorithms")
     print('='*60)
     
-    for i in range(n_parents):
+    # First, add the seed algorithm as a guaranteed valid baseline
+    print(f"\nAdding seed algorithm as baseline...")
+    seed_solution = make_solution(
+        code=SEED_ALGORITHM_CODE,
+        class_name="SeedOptimizer",
+        description="Baseline seed optimizer with correct bounds handling",
+        generation=0,
+    )
+    aucs, detailed_aucs, error = evaluate_algorithm(
+        SEED_ALGORITHM_CODE, "SeedOptimizer", args.eval_budget
+    )
+    if error:
+        print(f"  WARNING: Seed algorithm failed: {error}")
+        seed_solution.fitness = 0.0
+        seed_solution.error = error
+    else:
+        seed_solution.fitness = float(np.mean(aucs))
+        seed_solution.aucs = aucs
+        seed_solution.detailed_aucs = detailed_aucs
+        seed_solution.error = ""
+        print(f"  Seed algorithm fitness: {seed_solution.fitness:.4f}")
+        try:
+            mada_operator.ensure_blocks(seed_solution)
+        except Exception as parser_err:
+            print(f"  Parser warning: {parser_err}")
+    population.append(seed_solution)
+    
+    # Generate remaining parents via LLM
+    for i in range(n_parents - 1):
         if api_calls >= args.budget:
             print(f"Budget exhausted during initialization at {api_calls} calls")
             break
             
-        print(f"\nInitializing Parent {i+1}/{n_parents} (API call {api_calls+1})")
+        print(f"\nInitializing Parent {i+2}/{n_parents} (API call {api_calls+1})")
         
         try:
             message = algorithm_manager.fetch_algorithm()
@@ -477,12 +743,15 @@ def run_evolutionary_mode(
             if error:
                 solution.fitness = 0.0
                 solution.error = error
+                algorithm_manager.last_error = error
+                algorithm_manager.record_reject(algorithm_code)
                 print(f"  Error: {error}")
             else:
                 solution.fitness = float(np.mean(aucs))
                 solution.aucs = aucs
                 solution.detailed_aucs = detailed_aucs
                 solution.error = ""
+                algorithm_manager.last_error = ""
                 print(f"  Fitness: {solution.fitness:.4f}")
                 try:
                     mada_operator.ensure_blocks(solution)
@@ -506,6 +775,11 @@ def run_evolutionary_mode(
     # Sort initial population
     population = selection(population, len(population), elitism=True, minimization=False)
     best_ever = population[0]
+    archive = _update_archive(
+        archive,
+        population,
+        size=min(max(2 * n_parents, 10), n_parents + n_offspring),
+    )
     
     print(f"\nInitialization complete. Best initial fitness: {best_ever.fitness:.4f}")
     
@@ -531,6 +805,7 @@ def run_evolutionary_mode(
         
         # Generate offspring
         offspring = []
+        strategy_positive = {"recombination": 0, "innovation": 0}
         for i in range(n_offspring):
             if api_calls >= args.budget:
                 print(f"Budget exhausted at offspring {i}/{n_offspring}")
@@ -546,6 +821,7 @@ def run_evolutionary_mode(
                     parents=parents,
                     focal_parent=parent,
                     population_summary=f"Current population:\n{pop_summary}",
+                    archive=archive,
                 )
                 child = make_solution(
                     code=proposal.code,
@@ -567,6 +843,8 @@ def run_evolutionary_mode(
                 if error:
                     child.fitness = 0.0
                     child.error = error
+                    algorithm_manager.last_error = error
+                    algorithm_manager.record_reject(proposal.code)
                     reward = -1.0
                     print(f"  Error: {error}")
                 else:
@@ -574,6 +852,7 @@ def run_evolutionary_mode(
                     child.aucs = aucs
                     child.detailed_aucs = detailed_aucs
                     child.error = ""
+                    algorithm_manager.last_error = ""
                     reward = child.fitness - best_parent_fitness
                     try:
                         mada_operator.ensure_blocks(child)
@@ -584,6 +863,9 @@ def run_evolutionary_mode(
                         print(f"  🎉 NEW BEST! {child.fitness:.4f} > {best_ever.fitness:.4f}")
                         best_ever = child
 
+                if proposal.strategy in strategy_positive and reward > 0:
+                    strategy_positive[proposal.strategy] += 1
+                mada_operator.record_outcome(proposal.strategy, reward)
                 mada_operator.update_bandits(child.get_lineage(), reward)
                 offspring.append(child)
                 explogger.log_code(api_calls, child.name, child.code)
@@ -606,10 +888,28 @@ def run_evolutionary_mode(
             population = selection(offspring, n_parents, elitism=False, minimization=False)
             print(f"\nSelection: (μ,λ) - Best {n_parents} from {len(offspring)} offspring")
 
+        # Penalize stagnant strategies (no positive reward this generation)
+        for strat, count in strategy_positive.items():
+            if count == 0:
+                mada_operator.record_outcome(strat, -0.01)
+
         # Log both fitness and algorithm names for the new parent population
         print(
             "New population parents:",
             [f"{ind.name} (fitness={ind.fitness:.4f})" for ind in population[:n_parents]],
+        )
+        archive = _update_archive(
+            archive,
+            population + offspring + [best_ever],
+            size=min(max(2 * n_parents, 10), n_parents + n_offspring),
+        )
+        print(
+            "Recent strategy success rates:",
+            {
+                "recomb": f"{mada_operator.success_rate('recombination'):.2f}",
+                "innov": f"{mada_operator.success_rate('innovation'):.2f}",
+                "legacy": f"{mada_operator.success_rate('legacy'):.2f}",
+            },
         )
     
     # Final summary
