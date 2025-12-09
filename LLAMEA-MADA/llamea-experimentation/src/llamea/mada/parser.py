@@ -62,6 +62,62 @@ ROLE_HINTS: Dict[str, Dict[str, Tuple[Tuple[str, float], ...]]] = {
 
 
 @dataclass
+class ContextBundle:
+    """
+    MADA 4.0 "Context Block" (+1 in the 4+1 Architecture).
+    
+    Contains shared state and dependencies that functional blocks rely on:
+    - imports: Module-level import statements
+    - helpers: Module-level helper functions
+    - init_code: The __init__ method code
+    - init_assignments: Individual self.attr = value statements from __init__
+    - other_methods: Non-block class methods (helpers like update_archive())
+    """
+    imports: List[str] = field(default_factory=list)
+    helpers: Dict[str, str] = field(default_factory=dict)
+    init_code: str = ""
+    init_assignments: Dict[str, str] = field(default_factory=dict)
+    other_methods: Dict[str, str] = field(default_factory=dict)
+    
+    def get_all_helper_names(self) -> Set[str]:
+        """Return names of all available helper methods."""
+        return set(self.helpers.keys()) | set(self.other_methods.keys())
+    
+    def get_all_attribute_names(self) -> Set[str]:
+        """Return names of all initialized attributes."""
+        return set(self.init_assignments.keys())
+    
+    def to_prompt_string(self) -> str:
+        """Format context for LLM prompts with explicit attribute enforcement."""
+        lines = []
+        
+        if self.imports:
+            lines.append("# Imports:")
+            lines.extend(self.imports[:10])  # Limit for prompt size
+        
+        helper_names = sorted(self.get_all_helper_names())
+        if helper_names:
+            lines.append(f"\n# Available helper methods: {', '.join(helper_names)}")
+        else:
+            lines.append("\n# Available helper methods: (none - do not call undefined methods)")
+        
+        attr_names = sorted(self.get_all_attribute_names())
+        if attr_names:
+            lines.append(f"# Initialized attributes: {', '.join(attr_names)}")
+            # Add explicit bounds hint if lb/ub exist
+            if "lb" in attr_names and "ub" in attr_names:
+                lines.append("# NOTE: Use self.lb and self.ub for bounds (NOT self.domain, self.bounds, etc.)")
+            if "pop" in attr_names:
+                lines.append("# NOTE: Use self.pop for population (NOT self.population)")
+            if "dim" in attr_names:
+                lines.append("# NOTE: Use self.dim for dimensionality (NOT self.n_dim, self.dimensions)")
+        else:
+            lines.append("# Initialized attributes: (check __init__ for available self.* attributes)")
+        
+        return "\n".join(lines)
+
+
+@dataclass
 class ParsedAlgorithm:
     """Container for all structural parts needed to rebuild an algorithm."""
 
@@ -80,6 +136,24 @@ class ParsedAlgorithm:
     placeholder_reasons: Dict[str, str] = field(default_factory=dict)
     init_attributes: Set[str] = field(default_factory=set)
     init_assignments: Dict[str, str] = field(default_factory=dict)
+    
+    def get_context_bundle(self) -> ContextBundle:
+        """
+        Extract the Context Block (+1) from this parsed algorithm.
+        
+        MADA 4.0 Section 5.6: The Context Block contains __init__, imports,
+        and all custom helper functions that functional blocks depend on.
+        """
+        return ContextBundle(
+            imports=list(self.imports),
+            helpers=dict(self.helpers),
+            init_code=self.other_methods.get("__init__", ""),
+            init_assignments=dict(self.init_assignments),
+            other_methods={
+                name: code for name, code in self.other_methods.items()
+                if name != "__init__"
+            },
+        )
 
     def to_metadata(self) -> Dict[str, object]:
         """Return a serialisable representation for Solution.metadata."""
@@ -103,6 +177,12 @@ class ParsedAlgorithm:
             "helper_groups": _serialise(self.helper_groups),
             "coverage": self.coverage,
             "placeholder_reasons": self.placeholder_reasons,
+            "context_bundle": {
+                "imports": self.imports,
+                "helper_names": list(self.helpers.keys()),
+                "init_attributes": list(self.init_attributes),
+                "other_method_names": list(self.other_methods.keys()),
+            },
         }
 
 
@@ -559,4 +639,256 @@ class _DependencyVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in self.imported_symbols:
             self.imports.add(node.id)
+
+
+def union_merge_contexts(
+    contexts: List[ContextBundle],
+    prefer_first: bool = True,
+) -> Tuple[ContextBundle, Dict[str, str]]:
+    """
+    MADA 4.0 Section 5.6: Union-merge Context Blocks from multiple parents.
+    
+    When recombining Parent A and Parent B:
+    - The offspring inherits the UNION of all helper functions and state variables
+    - This ensures that if "Parent A's Mutation" calls `calculate_velocity()`,
+      that helper function is present in the offspring.
+    
+    Args:
+        contexts: List of ContextBundle objects from donor parents.
+        prefer_first: If True, prefer the first context's version on conflict.
+    
+    Returns:
+        Tuple of (merged ContextBundle, conflict_map showing renamed items)
+    """
+    if not contexts:
+        return ContextBundle(), {}
+    
+    if len(contexts) == 1:
+        return contexts[0], {}
+    
+    merged = ContextBundle()
+    conflict_map: Dict[str, str] = {}
+    
+    # Merge imports (deduplicate)
+    seen_imports: Set[str] = set()
+    for ctx in contexts:
+        for imp in ctx.imports:
+            normalized = imp.strip()
+            if normalized not in seen_imports:
+                seen_imports.add(normalized)
+                merged.imports.append(imp)
+    
+    # Merge module-level helpers (detect conflicts by hash)
+    helper_hashes: Dict[str, str] = {}  # name -> hash of code
+    for i, ctx in enumerate(contexts):
+        for name, code in ctx.helpers.items():
+            code_hash = hashlib.sha256(code.encode()).hexdigest()[:16]
+            if name not in merged.helpers:
+                merged.helpers[name] = code
+                helper_hashes[name] = code_hash
+            elif helper_hashes.get(name) != code_hash:
+                # Conflict: different implementations with same name
+                if prefer_first:
+                    continue  # Keep first version
+                else:
+                    # Rename the conflicting helper
+                    new_name = f"{name}_v{i+1}"
+                    merged.helpers[new_name] = code
+                    conflict_map[name] = new_name
+    
+    # Merge other_methods (class helper methods)
+    method_hashes: Dict[str, str] = {}
+    for i, ctx in enumerate(contexts):
+        for name, code in ctx.other_methods.items():
+            code_hash = hashlib.sha256(code.encode()).hexdigest()[:16]
+            if name not in merged.other_methods:
+                merged.other_methods[name] = code
+                method_hashes[name] = code_hash
+            elif method_hashes.get(name) != code_hash:
+                if prefer_first:
+                    continue
+                else:
+                    new_name = f"{name}_v{i+1}"
+                    merged.other_methods[new_name] = code
+                    conflict_map[name] = new_name
+    
+    # Merge init_assignments (union of all attributes)
+    for ctx in contexts:
+        for attr, stmt in ctx.init_assignments.items():
+            if attr not in merged.init_assignments:
+                merged.init_assignments[attr] = stmt
+            # If already present, keep first (deterministic tie-break per spec)
+    
+    # Use first context's __init__ as base (it will be augmented with merged assignments)
+    merged.init_code = contexts[0].init_code if contexts else ""
+    
+    return merged, conflict_map
+
+
+def detect_unused_helpers(
+    code: str,
+    helper_names: Set[str],
+) -> Set[str]:
+    """
+    Detect helper methods that are never called in the code.
+    
+    Used by the semantic linter to prune dead code after context merge.
+    
+    Args:
+        code: Full class code to analyze.
+        helper_names: Set of helper method names to check.
+    
+    Returns:
+        Set of helper names that are never referenced.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    
+    # Collect all method calls on self
+    called_methods: Set[str] = set()
+    
+    class CallCollector(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "self":
+                    called_methods.add(node.func.attr)
+            self.generic_visit(node)
+    
+    CallCollector().visit(tree)
+    
+    return helper_names - called_methods
+
+
+# Common attribute aliases that LLMs incorrectly use
+FORBIDDEN_ATTRIBUTE_ALIASES = {
+    "domain": ["lb", "ub"],
+    "domain_range": ["lb", "ub"],
+    "bounds": ["lb", "ub"],
+    "lower_bound": ["lb"],
+    "upper_bound": ["ub"],
+    "population": ["pop"],
+    "n_dim": ["dim"],
+    "dimensions": ["dim"],
+    "dimension": ["dim"],
+}
+
+
+def validate_snippet_attributes(
+    snippet: str,
+    allowed_attributes: Set[str],
+    allowed_methods: Set[str],
+) -> Tuple[bool, Set[str], Dict[str, List[str]]]:
+    """
+    Validate that a code snippet only uses allowed self.* attributes and methods.
+    
+    MADA 4.0: Pre-validation to reject LLM-generated blocks that reference
+    undefined attributes before they cause runtime errors.
+    
+    Args:
+        snippet: The code snippet to validate.
+        allowed_attributes: Set of allowed self.attr names.
+        allowed_methods: Set of allowed self.method() names.
+    
+    Returns:
+        Tuple of:
+        - is_valid: True if all references are allowed
+        - invalid_refs: Set of invalid attribute/method references
+        - suggestions: Dict mapping invalid refs to suggested alternatives
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(snippet))
+    except SyntaxError:
+        return False, {"__syntax_error__"}, {}
+    
+    referenced_attrs: Set[str] = set()
+    referenced_methods: Set[str] = set()
+    
+    class RefCollector(ast.NodeVisitor):
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if isinstance(node.value, ast.Name) and node.value.id == "self":
+                referenced_attrs.add(node.attr)
+            self.generic_visit(node)
+        
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "self":
+                    referenced_methods.add(node.func.attr)
+            self.generic_visit(node)
+    
+    RefCollector().visit(tree)
+    
+    # Check for invalid attribute references
+    # Attributes can be accessed either as attrs or as methods (for helpers)
+    all_allowed = allowed_attributes | allowed_methods
+    invalid_refs = (referenced_attrs | referenced_methods) - all_allowed
+    
+    # Generate suggestions for common mistakes
+    suggestions: Dict[str, List[str]] = {}
+    for ref in invalid_refs:
+        if ref in FORBIDDEN_ATTRIBUTE_ALIASES:
+            # Check which aliases exist in allowed_attributes
+            valid_alternatives = [
+                alt for alt in FORBIDDEN_ATTRIBUTE_ALIASES[ref]
+                if alt in allowed_attributes
+            ]
+            if valid_alternatives:
+                suggestions[ref] = valid_alternatives
+    
+    is_valid = len(invalid_refs) == 0
+    return is_valid, invalid_refs, suggestions
+
+
+def get_attribute_correction_hint(
+    invalid_refs: Set[str],
+    suggestions: Dict[str, List[str]],
+) -> str:
+    """
+    Generate a human-readable hint for correcting invalid attribute references.
+    
+    Args:
+        invalid_refs: Set of invalid attribute/method names.
+        suggestions: Dict mapping invalid refs to valid alternatives.
+    
+    Returns:
+        A formatted string with correction hints.
+    """
+    if not invalid_refs:
+        return ""
+    
+    lines = ["The following self.* references are INVALID:"]
+    for ref in sorted(invalid_refs):
+        if ref in suggestions and suggestions[ref]:
+            alts = ", ".join(f"self.{a}" for a in suggestions[ref])
+            lines.append(f"  - self.{ref} → Use instead: {alts}")
+        else:
+            lines.append(f"  - self.{ref} (not defined in __init__)")
+    
+    return "\n".join(lines)
+
+
+def expand_attributes_with_aliases(attrs: Set[str]) -> Set[str]:
+    """
+    Expand the allowed attribute set with common aliases so that
+    equivalent names are treated as valid (e.g., lb <-> lower_bound).
+    """
+    expanded = set(attrs)
+
+    alias_map = {
+        "lb": ["lower_bound", "lower_bounds", "bounds"],
+        "ub": ["upper_bound", "upper_bounds", "bounds"],
+        "pop": ["population", "population_vectors"],
+        "dim": ["n_dim", "ndim", "dimensions", "dimension"],
+    }
+
+    for canonical, aliases in alias_map.items():
+        if canonical in attrs:
+            expanded.update(aliases)
+        for alias in aliases:
+            if alias in attrs:
+                expanded.add(canonical)
+                expanded.update(aliases)
+
+    return expanded
 
