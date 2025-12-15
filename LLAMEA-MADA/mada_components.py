@@ -14,15 +14,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
+# Import OverBudgetException from utils to avoid duplicate class issue
+from utils import OverBudgetException
+
 
 # ==============================================================================
 # TRACE COLLECTION
 # ==============================================================================
-
-class OverBudgetException(Exception):
-    """Raised when evaluation budget is exceeded."""
-    pass
-
 
 class TraceCollector:
     """
@@ -217,6 +215,190 @@ def calculate_nn_dist(
         min_distance = min(min_distance, distance)
     
     return min_distance if min_distance != float('inf') else 1.0
+
+
+# ==============================================================================
+# BEHAVIORAL PARENT SELECTION
+# ==============================================================================
+
+def select_behavioral_parents(
+    population: List,
+    enabled: bool = True,
+    trace_attr: str = 'trace',
+    fitness_attr: str = 'fitness'
+) -> Tuple:
+    """
+    Select parents for crossover using behavioral diversity (trace-based selection).
+    
+    This implements Diversity-Based Crossover Selection for MADA-LLAMEA:
+    - Parent A (Exploitation): Highest-fitness individual
+    - Parent B (Exploration): Individual with maximum trace distance from Parent A
+    
+    Mathematical Foundation:
+        d(A, B) = sqrt(sum((Trace_A[i] - Trace_B[i])^2)) / sqrt(len)
+    
+    Args:
+        population: List of solution objects with .fitness and .trace attributes
+        enabled: If False, falls back to fitness-based selection (no trace comparison)
+        trace_attr: Name of the trace attribute (default: 'trace')
+        fitness_attr: Name of the fitness attribute (default: 'fitness')
+    
+    Returns:
+        Tuple (parent_a, parent_b):
+            - parent_a: Best-fitness individual
+            - parent_b: Most behaviorally diverse individual from parent_a
+                       (or second-best fitness if behavioral selection disabled)
+    
+    Example:
+        >>> parents = select_behavioral_parents(population, enabled=True)
+        >>> child = crossover(parents[0], parents[1])
+    """
+    if not population:
+        raise ValueError("Population cannot be empty")
+    
+    if len(population) == 1:
+        return (population[0], population[0])
+    
+    # Sort by fitness (descending - higher is better)
+    sorted_pop = sorted(
+        population, 
+        key=lambda x: getattr(x, fitness_attr, 0.0), 
+        reverse=True
+    )
+    
+    # Parent A: Best fitness (exploitation)
+    parent_a = sorted_pop[0]
+    
+    # If behavioral selection is disabled, return top 2 by fitness
+    if not enabled:
+        parent_b = sorted_pop[1]
+        return (parent_a, parent_b)
+    
+    # Get Parent A's trace
+    trace_a = getattr(parent_a, trace_attr, None)
+    
+    # If Parent A has no trace, fall back to fitness-based selection
+    if not trace_a or len(trace_a) == 0:
+        parent_b = sorted_pop[1]
+        return (parent_a, parent_b)
+    
+    # Convert to numpy array for efficient computation
+    trace_a_arr = np.array(trace_a, dtype=float)
+    trace_len = len(trace_a_arr)
+    
+    # Compute global min/max for normalization across all valid traces
+    all_traces = []
+    for ind in population:
+        t = getattr(ind, trace_attr, None)
+        if t and len(t) > 0:
+            all_traces.append(np.array(t, dtype=float))
+    
+    if not all_traces:
+        # No valid traces, fall back to fitness-based
+        parent_b = sorted_pop[1]
+        return (parent_a, parent_b)
+    
+    # Global normalization range
+    global_min = min(np.min(t) for t in all_traces)
+    global_max = max(np.max(t) for t in all_traces)
+    range_val = global_max - global_min
+    
+    # Normalize Parent A's trace
+    if range_val > 1e-10:
+        trace_a_norm = (trace_a_arr - global_min) / range_val
+    else:
+        trace_a_norm = np.zeros_like(trace_a_arr)
+    
+    # Find Parent B: Maximum Euclidean distance from Parent A
+    max_distance = -1.0
+    parent_b = sorted_pop[1]  # Default fallback
+    
+    for candidate in sorted_pop[1:]:  # Skip Parent A
+        trace_b = getattr(candidate, trace_attr, None)
+        
+        if not trace_b or len(trace_b) == 0:
+            continue
+        
+        trace_b_arr = np.array(trace_b, dtype=float)
+        
+        # Handle length mismatch - use minimum length
+        min_len = min(len(trace_a_norm), len(trace_b_arr))
+        
+        # Normalize candidate's trace
+        if range_val > 1e-10:
+            trace_b_norm = (trace_b_arr[:min_len] - global_min) / range_val
+        else:
+            trace_b_norm = np.zeros(min_len)
+        
+        trace_a_trimmed = trace_a_norm[:min_len]
+        
+        # Euclidean distance (normalized by sqrt(length) for scale-invariance)
+        distance = np.sqrt(np.sum((trace_a_trimmed - trace_b_norm) ** 2))
+        if min_len > 0:
+            distance = distance / np.sqrt(min_len)
+        
+        if distance > max_distance:
+            max_distance = distance
+            parent_b = candidate
+    
+    return (parent_a, parent_b)
+
+
+def calculate_trace_distance(
+    trace_a: List[float],
+    trace_b: List[float],
+    global_min: Optional[float] = None,
+    global_max: Optional[float] = None
+) -> float:
+    """
+    Calculate normalized Euclidean distance between two optimization traces.
+    
+    This is a utility function for pairwise trace comparison.
+    
+    Formula: d(A, B) = sqrt(sum((Trace_A[i] - Trace_B[i])^2)) / sqrt(len)
+    
+    Args:
+        trace_a: First optimization trace (best-so-far values)
+        trace_b: Second optimization trace
+        global_min: Minimum value for normalization (computed if None)
+        global_max: Maximum value for normalization (computed if None)
+    
+    Returns:
+        float: Normalized Euclidean distance in approximate [0, 1] range
+    """
+    if not trace_a or not trace_b:
+        return 0.0
+    
+    arr_a = np.array(trace_a, dtype=float)
+    arr_b = np.array(trace_b, dtype=float)
+    
+    # Determine normalization bounds
+    if global_min is None or global_max is None:
+        combined = np.concatenate([arr_a, arr_b])
+        global_min = np.min(combined)
+        global_max = np.max(combined)
+    
+    range_val = global_max - global_min
+    
+    # Normalize traces
+    if range_val > 1e-10:
+        norm_a = (arr_a - global_min) / range_val
+        norm_b = (arr_b - global_min) / range_val
+    else:
+        norm_a = np.zeros_like(arr_a)
+        norm_b = np.zeros_like(arr_b)
+    
+    # Handle length mismatch
+    min_len = min(len(norm_a), len(norm_b))
+    norm_a = norm_a[:min_len]
+    norm_b = norm_b[:min_len]
+    
+    # Euclidean distance normalized by sqrt(length)
+    distance = np.sqrt(np.sum((norm_a - norm_b) ** 2))
+    if min_len > 0:
+        distance = distance / np.sqrt(min_len)
+    
+    return distance
 
 
 # ==============================================================================
@@ -510,6 +692,45 @@ def _test_components():
     assert abs(div_b - expected_div_bonus) < 0.01, f"Diversity bonus: {div_b}"
     assert abs(reward - expected_total) < 0.01, f"Total reward: {reward}"
     print("  ✓ compute_composite_reward: formula correct")
+    
+    # Test select_behavioral_parents
+    class MockSolution:
+        def __init__(self, fitness, trace):
+            self.fitness = fitness
+            self.trace = trace
+    
+    # Create test population with different traces
+    pop = [
+        MockSolution(0.9, [1.0, 0.9, 0.8, 0.7, 0.6]),  # Best fitness, trace A
+        MockSolution(0.7, [1.0, 0.5, 0.3, 0.2, 0.1]),  # Different trace (more diverse)
+        MockSolution(0.8, [1.0, 0.85, 0.75, 0.65, 0.55]),  # Similar to best
+        MockSolution(0.6, [0.5, 0.4, 0.3, 0.2, 0.1]),  # Very different trace
+    ]
+    
+    # Test with behavioral selection enabled
+    parent_a, parent_b = select_behavioral_parents(pop, enabled=True)
+    assert parent_a.fitness == 0.9, f"Parent A should be best fitness: {parent_a.fitness}"
+    # Parent B should NOT be the most similar trace (index 2)
+    assert parent_b.fitness != 0.8, f"Parent B should be diverse, not most similar"
+    print("  ✓ select_behavioral_parents: selects diverse parent")
+    
+    # Test with behavioral selection disabled (fitness-based fallback)
+    parent_a_fb, parent_b_fb = select_behavioral_parents(pop, enabled=False)
+    assert parent_a_fb.fitness == 0.9, "Fallback: Parent A should be best fitness"
+    assert parent_b_fb.fitness == 0.8, "Fallback: Parent B should be second-best fitness"
+    print("  ✓ select_behavioral_parents: fallback works when disabled")
+    
+    # Test calculate_trace_distance
+    dist_same = calculate_trace_distance(trace1, trace3)
+    dist_diff = calculate_trace_distance(trace1, trace2)
+    assert dist_same < 0.01, f"Same traces should have ~0 distance: {dist_same}"
+    assert dist_diff > 0.1, f"Different traces should have positive distance: {dist_diff}"
+    print("  ✓ calculate_trace_distance: pairwise distance works")
+    
+    # Test edge cases
+    parent_a_single, parent_b_single = select_behavioral_parents([pop[0]], enabled=True)
+    assert parent_a_single == parent_b_single, "Single population should return same parent"
+    print("  ✓ select_behavioral_parents: handles single population")
     
     print("\n✅ All MADA component tests passed!")
 

@@ -1,0 +1,1960 @@
+Discounted Thompson Sampling for Non-Stationary Bandit
+Problems
+Han Qi qihan19@stu.xjtu.edu.cn
+Yue Wang wy980521@stu.xjtu.edu.cn
+Li Zhu zhuli@xjtu.edu.cn
+Xi’an Jiaotong University,
+School of Software Engineering,
+Xianning West Road 28,
+Xi’an, 710049, China
+Abstract
+Non-stationary multi-armed bandit (NS-MAB) problems have recently received sig-
+nificant attention. NS-MAB are typically modelled in two scenarios: abruptly changing,
+where reward distributions remain constant for a certain period and change at unknown
+time steps, and smoothly changing, where reward distributions evolve smoothly based on
+unknown dynamics. In this paper, we propose Discounted Thompson Sampling (DS-TS)
+with Gaussian priors to address both non-stationary settings. Our algorithm passively
+adapts to changes by incorporating a discounted factor into Thompson Sampling. DS-
+TS method has been experimentally validated, but analysis of the regret upper bound is
+currently lacking. Under mild assumptions, we show that DS-TS with Gaussian priors
+√
+can achieve nearly optimal regret bound on the order of O˜( TB ) for abruptly changing
+T
+and O˜(Tβ) for smoothly changing, where T is the number of time steps, B is the num-
+T
+ber of breakpoints, β is associated with the smoothly changing environment and O˜ hides
+the parameters independent of T as well as logarithmic terms. Furthermore, empirical
+comparisons between DS-TS and other non-stationary bandit algorithms demonstrate its
+competitive performance. Specifically, when prior knowledge of the maximum expected
+reward is available, DS-TS has the potential to outperform state-of-the-art algorithms.
+1. Introduction
+The multi-armed bandit (MAB) problem is a well-known sequential decision problem. In
+each time step, the learner must choose an arm (referred to as an action) from a finite set
+of arms based on previous observations. The learner only receives the reward associated
+with the chosen action and does not observe the rewards of other unselected actions. The
+learner’s goal is to maximize the expected cumulative reward over time or, alternatively, to
+minimize the regret incurred during the learning process. Regret is defined as the difference
+betweentheexpectedrewardoftheoptimalarm(thearmwiththehighestexpectedreward)
+and the expected reward achieved by the MAB algorithm being used. Minimizing regret
+implies approaching the performance of the optimal arm as closely as possible.
+MAB has found practical use in various scenarios, with one of the earliest applications
+being the diagnosis and treatment experiments proposed by Robbins (1952). In this ex-
+periment, each patient’s treatment plan corresponds to an arm in the MAB problem, and
+the goal is to minimize the patient’s health loss by making optimal treatment decisions.
+1
+3202
+yaM
+22
+]GL.sc[
+2v81701.5032:viXra
+Recently, MAB has gained wide-ranging applicability. For example, MAB algorithms have
+been used in online recommendation systems to improve user experiences and increase en-
+gagement (Li, Chu, Langford, & Wang, 2011; Bouneffouf, Bouzeghoub, & Ganarski, 2012;
+Li, Karatzoglou, & Gentile, 2016). Similarly, MAB has been employed in online adver-
+tising campaigns to optimize the allocation of resources and maximize the effectiveness of
+ad placements (Schwartz, Bradlow, & Fader, 2017). While the standard MAB model as-
+sumes fixed reward distributions, real-world scenarios often involve changing distributions
+over time. For instance, in online recommendation systems, the collected data gradually
+becomes outdated, and user preferences are likely to evolve (Wu, Iyer, & Wang, 2018). This
+dynamicnaturenecessitatesthedevelopmentofalgorithmsthatcanadapttothesechanges,
+leading to the exploration of non-stationary MAB problems.
+In recent years, extensive research has been conducted on non-stationary multi-armed
+bandit (MAB) problems. These research efforts can be broadly categorized into two ap-
+proaches. The first category involves using change-point detection algorithms to identify
+when the reward distribution changes (Liu, Lee, & Shroff, 2018; Cao, Wen, Kveton, & Xie,
+2019; Auer, Gajane, & Ortner, 2019; Chen, Lee, Luo, & Wei, 2019; Besson, Kaufmann,
+Maillard, & Seznec, 2022). The second category focuses on passively reducing the influence
+of past observations (Garivier & Moulines, 2011; Raj & Kalyani, 2017; Trovo, Paladino,
+Restelli, & Gatti, 2020; Baudry, Russac, & Capp´e, 2021). The former approach relies on
+certain assumptions about the changes in the distribution of arms to ensure the effective-
+ness of the change-point detection algorithm. For example, methods proposed by Liu et al.
+(2018) and Cao et al. (2019) require a lower bound on the amplitude of change in the ex-
+pected rewards for each arm. The latter approach requires fewer assumptions about the
+characteristics of the changes. These methods often employ techniques such as sliding win-
+dows or discount factors to forget past information and adapt to the changing distribution
+of arms. Frequentist algorithms in both categories provide theoretical guarantees for regret
+upper bounds. However, in the case of Bayesian methods, such as Thompson Sampling,
+there is a lack of theoretical analysis regarding regret in non-stationary MAB problems,
+despite these algorithms demonstrating superior or comparable performance to frequentist
+algorithms in most non-stationary scenarios. To the best of our knowledge, only sliding
+window Thompson Sampling (Trovo et al., 2020) has provided regret upper bounds. Raj
+andKalyani(2017)haveexploreddiscountedThompsonSamplingwithBernoullipriorsbut
+onlyderivedtheprobabilityofselectingasub-optimalarminthesimplecaseofatwo-armed
+bandit.
+Inthispaper,weproposeDiscountedThompsonSampling(DS-TS)withGaussianpriors
+forbothabruptlychangingandsmoothlychangingsettings. Intheformer, thedistributions
+of rewards remain constant during a period of rounds and change at unknown rounds, while
+in the latter, the reward distribution evolves smoothly based on unknown dynamics. We
+adopt a unified method to analyze the regret upper bound for both non-stationary settings.
+√
+WeshowthattheregretupperboundofDS-TSforabruptlychangingsettingsisO˜( TB ),
+T
+where T is the number of time steps, B is the number of breakpoints. This regret bound
+√ T
+matches the Ω( T) lower bound proven by Garivier and Moulines (2011) in an order sense.
+For the smoothly changing settings, we derive the regret bound of order O˜(Tβ), where
+β measures the number of rounds that the arms’ expected rewards are close enough. In
+additional, we compare DS-TS with other non-stationary bandits algorithms empirically.
+2
+Specially, if we know the information of the maximum of the expected rewards, by tuning
+the parameter τ , our algorithm can outperform the state-of-the-art algorithms.
+max
+2. Related Work
+Non-stationary MAB settings have received attention in the last few years. These meth-
+ods can be roughly divided into two categories: they detect when the reward distribution
+changes with change-point detection algorithms or they passively reduce the effect of past
+√
+observations. Most of these works can achieve the regret upper bound of O˜( T).
+Many works are based on the idea of forgetting past observations. Discounted UCB
+(DS-UCB) (Kocsis & Szepesv´ari, 2006; Garivier & Moulines, 2011) uses a discounted factor
+to average the past rewards. In order to achieve the purpose of forgetting information, the
+weightoftheearlyrewardissmaller. GarivierandMoulines(2011)alsoproposethesliding-
+window UCB (SW-UCB) by only using a few recent rewards to compute the UCB index.
+√
+They calculate the regret upper bound for DS-UCB and SW-UCB as O˜( TB ). EXP3.S,
+T
+as proposed in (Auer, Cesa-Bianchi, Freund, & Schapire, 2002), has been shown to achieve
+√
+the regret upper bound by O˜( TB ). Under the assumption that the total variation of the
+T
+expected rewards over the time horizon is bounded by a budget V , Besbes, Gur, and Zeevi
+T
+(2014) introduce REXP3 with regret O˜(T2/3). Combes and Proutiere (2014) propose the
+SW-OSUBalgorithm, specificallyforthecaseofsmoothlychangingwithanupperboundof
+O˜(σ1/4T), where σ is the Lipschitz constant of the evolve process. Raj and Kalyani (2017)
+proposethediscountedThompsonsamplingforBernoullipriorswithoutprovidingtheregret
+upper bound. They only calculate the probability of picking a sub-optimal arm for the
+simplecaseofatwo-armedbandit. Recently, Trovoetal.(2020)proposethesliding-window
+Thompson sampling algorithm with regret O˜(T 1+ 2 α ) for abruptly changing and O˜(Tβ) for
+smoothly changing. Baudry et al. (2021) propose a novel algorithm named Sliding Window
+√
+Last Block Subsampling Duelling Algorithm (SW-LB-SDA) with regret O˜( TB ). They
+T
+only assume that the reward distributions belong to the same one-parameter exponential
+family for all arms during each stationary phase.
+There are also many works that exploit techniques from the field of change detection
+to deal with reward distributions varying over time. Mellor and Shapiro (2013) combine
+a Bayesian change point mechanism and Thompson sampling strategy to tackle the non-
+stationary problem. Their algorithm can detect global switching and per-arm switching.
+Liu et al. (2018) propose a change-detection framework that combines UCB and a change-
+detection algorithm named CUSUM. They obtain an upper bound for the average detection
+delayandalowerboundfortheaveragetimebetweenfalsealarms. Caoetal.(2019)propose
+M-UCB, which is similar to CUSUM but use another simpler change-detection algorithm.
+√
+M-UCB and CUMSUM are nearly optimal, their regret bounds are O˜( TB ).
+T
+Recently, therearealsosomeworksderivingregretboundswithoutknowingthenumber
+of changes. For example, Auer et al. (2019) propose an algorithm called ADSWITCH with
+√
+optimal regret bound O˜( B T). Suk and Kpotufe (2022) improve the work (Auer et al.,
+T √
+2019) so that the obtained regret bound is smaller than O˜( ST), where S only counts the
+best arms switches.
+3
+3. Problem Formulation
+Assume that the non-stationary MAB problem has K arms A := {1,2,...,K} with finite
+time horizon T. At round t, the learner must select an arm i ∈ A and obtain the corre-
+t
+sponding reward X (i ). The rewards are generated from different distributions (unknown
+t t
+to the learner) with bounded support. Without loss of generality, suppose the support set
+is [0,1]. The expectation of X (i) is denoted as µ (i) = E[X (i)]. A policy π is a function
+t t t
+π(h ) = i that selects arm i to play at round t. Let µ (∗) := max µ (i) denote
+t t t t i∈{1,...,K} t
+the expected reward of the optimal arm i∗ at round t. Unlike the stationary MAB settings,
+t
+where an arm is optimal all of the time (i.e. ∀t ∈ {1,...,T},i∗ = i∗), while in the non-
+t
+stationary settings, the optimal arms might change over time. The performance of a policy
+π is measured in terms of cumulative expected regret:
+(cid:34) T (cid:35)
+(cid:88)
+Rπ = E (µ (∗)−µ (i )) , (1)
+T t t t
+t=1
+where E[·] is the expectation with respect to randomness of π. Let ∆ (i) := µ (∗)−µ (i)
+t t t
+and let
+T
+(cid:88)
+k (i) := 1{i = i,i (cid:54)= i∗}
+T t t
+t=1
+denote the number of plays of arm i when it is not the best arm until time T,
+K T K
+(cid:88)(cid:88) (cid:88)
+Rπ = ∆ (i)E[1{i = i}] ≤ E[k (i)].
+T t t T
+i=1 t=1 i=1
+When we analyze the upper bound of Rπ, we can directly analyze E[k (i)] to get the upper
+T T
+bound of each arm. Next, we give detailed description of the two non-stationary scenarios.
+Abruptly Changing. The abruptly changing settings is introduced by Garivier and
+Moulines (2011) for the first time. Suppose the set of breakpoints is B = {b ,...,b } (
+1 BT
+we define b = 1). At each breakpoint, the reward distribution changes for at least one arm.
+1
+Theroundsbetweentwoadjacentbreakpointsarecalledstationary phase. Inthestationary
+phase, the reward distribution of all arms does not change. Different from previous studies
+(Besbes et al., 2014; Liu et al., 2018; Cao et al., 2019), which imposed constraints on the
+variationofexpectedrewards,wedonotimposeconstraintsonthisvariationinoursettings.
+Trovo et al. (2020) makes assumption about the number of breakpoints to facilitate more
+generalized analysis, while we explicitly use B to represent the number of breakpoints for
+T
+analysis.
+Smoothly Changing. The smoothly changing setting have been studied by Combes and
+Proutiere (2014), Trovo et al. (2020). At each time step, the expected reward for each arm
+varies by no more than σ and the learner doesn’t have any information on how the rewards
+evolve. These limitations can be described by the following Lipschitz assumption:
+Assumption 1. Thereexitsσ > 0,forallt,t (cid:48) ≥ 1,1 ≤ i ≤ K,itholdsthat|µ
+t
+(i)−µ t(cid:48)(i)| ≤
+σ|t−t (cid:48)|.
+4
+4. Discounted Thompson Sampling
+In this section, we propose the Discounted Thompson Sampling algorithm with Gaussian
+priorsforthenon-stationarystochasticMABproblems. Asin(Agrawal&Goyal, 2013), our
+algorithm uses an implicit assumption that the likelihood of reward X (t) can be modeled
+i
+by Gaussian distribution. While the actual rewards distribution can be any distribution
+with support in [0,1]. We use a discount factor γ (0 < γ < 1) to dynamically adjust the
+estimate of each arm’s distribution. The key to our algorithm is to decrease the sampling
+variance of the selected arm while increasing the sampling variance of the unselected arms.
+Specifically, let N (γ,i) = (cid:80)t γt−j1{i = i} denotes the discounted number of plays
+t j=1 j
+of arm i until time t. We use µˆ (γ,i) = 1 (cid:80)t γt−jX (i)1{i = i} called discounted
+t Nt(γ,i) j=1 j j
+empiricalaveragetoestimatetheexpectedrewardsofarmi. Thesamplingvarianceforarm
+i at round t is denoted as τ (i)2. At round t, arm i samples from the Gaussian distribution
+t
+N(µˆ (γ,i),τ (i)2). Recall that the rewards are in range [0,1], thus the variance cannot
+t t
+be increased to infinity, which would move the sampling away from the expectation. We
+restrict the upper bound on the variance to τ2 , then the sampling variance is τ (i) =
+max t
+min{√ 1 ,τ }.
+max
+Nt(γ,i)
+Let µ˜ (γ,i) = (cid:80)t γt−jX (i)1{i = i} as the discounted cumulative reward. If arm i
+t j=1 j j
+is selected at round t, the posterior distribution is updated as follows:
+γµˆ (γ,i)N (γ,i)+X (i) µ˜ (γ,i)
+t t t t+1
+µˆ (γ,i) = =
+t+1
+γN (γ,i)+1 N (γ,i)
+t t+1
+If arm i isn’t selected at round t, the posterior distribution is updated as
+µ˜ (γ,i) γµ˜ (γ,i)
+t+1 t
+µˆ (γ,i) = = = µˆ (γ,i)
+t+1 t
+N (γ,i) γN (γ,i)
+t+1 t
+i.e. the expectation of posterior distribution remains unchanged.
+Algorithm 1 shows the pseudocode of DS-TS. We initialize the prior distributions with
+µˆ (i) = 0,τ (i) = 1. Line 5 is the Thompson sampling. For each arm, we draw a random
+1 1
+sampleθ (i)fromN(µˆ (γ,i),τ (i)2). Thenweselectarmi withthemaximumsamplevalue
+t t t t
+toplayandobtaintherewardX (i )(Line7). ToavoidthetimecomplexitygoingtoO(T2),
+t t
+we introduce µ˜ (i) to calculate µˆ (γ,i) using an iterative method(Line 9-11). Finally, we
+t t
+update the posterior variance τ2 of each arm (Line 12).
+i
+Related to Thompson Sampling. If γ = 1, DS-TS is equivalent to Thompson Sam-
+plingwithstationarysettingsproposedbyAgrawalandGoyal(2013)exceptforthevariance.
+Their sampling variance is 1 (k is the number plays of arm i), which are updated ac-
+ki+1 i
+cording to the standard Bayesian posterior distribution. While we truncate it to τ to
+max
+prevent the posterior variance from becoming infinite.
+Related to Discounted UCB. Line 7 in Algorithm 1 can be rewritten as
+i = argmaxµˆ (γ,i)+(cid:15) (i),(cid:15) (i) ∼ N(0,τ (i)2)
+t t t t t
+i
+WeusethesamemethodasDS-UCB(Garivier&Moulines, 2011)toupdateµˆ (γ,i). Asfor
+t
+(cid:113)
+selectingthebestarm,DS-UCBusesapaddingfunctionc (γ,i) = 2B
+ξlognt(γ)
+,whereB,ξ
+t Nt(γ,i)
+5
+Algorithm 1: DS-TS
+1 Input: discounted factor γ ∈ (1− 1 e ,1), τ max ,
+2 µˆ 1 (i) = 0, µ˜ 1 (i) = 0, N t (γ,i) = 0, τ 1 (i) = τ max .
+3 for t = 1,...,T do
+4 for i = 1,..,K do
+5 sample θ t (i) independently from N(µˆ t (γ,i),τ t (i)2)
+6 end
+7 Play arm i t = argmax i θ t (i) and observe reward X t (i t ).
+8 for i = 1,...,K do
+9 µ˜ t+1 (γ,i) = γµ˜ t (γ,i)+1{i = i t }X t (i t )
+10 N t+1 (γ,i) = γN t (γ,i)+1{i = i t }
+11 µˆ t+1 (γ,i) = N µ˜t t + + 1 1 ( ( γ γ , , i i ) )
+12 τ t+1 (i) = min{√ 1 ,τ max }
+Nt+1(γ,i)
+13 end
+14 end
+(cid:80)K
+is the tuning parameters, n (γ) = N (γ,i). While our approach can be viewed as re-
+t i=1 t
+placing the padding function with (cid:15) (i). Sampling from the normal distribution N(0,τ (i)2)
+t t
+is more exploratory than using deterministic padding function. In the experiment section,
+we will show the advantages of DS-TS.
+5. Our Results
+In this section, we give the upper bounds of DS-TS with abruptly changing and smoothly
+changing settings. Then we discuss how to take the values of the parameters so that the
+DS-TS reaches the optimal upper bound.
+5.1 Abruptly Changing Settings
+Recall that ∆ (i) := µ (∗)−µ (i). Let ∆ = min{∆ (i) : t ≤ T,i (cid:54)= i∗}, be the minimum
+t t t T t t
+differencebetweentheexpectedrewardofthebestarmi∗ andtheexpectedrewardofallarm
+t
+in all time T when the arm is not the best arm, and µ = max µ (t) ∈
+max t∈{1,...,T},i∈{1,...,K} i
+(0,1], be the maximum of expected rewards. Define function F(x) = √1 x e−x2/2.
+2π1+x2
+Theorem 1. Let γ ∈ (1− 1
+e
+,1),τ
+max
+≥
+12
+1√
+2
+. In the abruptly changing settings, for any
+arm i ∈ {1,...,K},
+1
+E[k (i)] ≤ B D(γ)+(C +2)L(γ)γ−1/(1−γ)T(1−γ)log( ),
+T T
+1−γ
+√
+where D(γ) = log(−(1−γ)2log(1−γ)) ,L(γ) = 144(1+ 2)2log( 1− 1 γ +e25) ,C = e25+12+ 1 .
+logγ γ1/(1−γ)(∆T)2 F(µ
+τm
+m
+a
+a
+x
+x)
+− 1
+Corollary 1. When γ is close to 1, γ 1−γ is around e. If the time horizon T and number
+of breakpoints B are known in advance, the discounted factor can be chosen as γ = 1−
+T
+6
+√
+(cid:112) B /T, then E[k (i)] = O( TB log2(T)). If B = O(Tα) for some α ∈ (0,1), this regret
+T T T T
+is upper bounded by O(T 1+ 2 α log2(T)).
+Remark1. Theconditionτ
+max
+≥ 1√ isimposedtohelptheanalysis. Fromtheexpression
+12 2
+for F(x) it is obvious that τ has a lower bound greater than 0. In fact, follows from
+max
+the proof of Lemma 2, τ max needs to satisfy the condition τ max ≥ √ ∆T√ (cid:113) 1 .
+12 2+3 1−γ log 1
+1−γ
+Since γ > 1−1
+e
+, τ
+max
+≥
+12
+1√
+2
+is clearly satisfied. Combining practical experience, too small
+sampling variance will make Thompson Sampling lose its exploration ability. In addition,
+if we know µ in advance, τ can be set suitably to improve the empirical performance
+max max
+of DS-TS. In the experimental section we will describe how to take the appropriate τ .
+max
+5.2 Smoothly Changing Settings
+Smoothly changing settings present greater challenges compared to abruptly changing set-
+tings. The primary difficulty arises from the fact that the expected rewards of different
+arms may be extremely close to each other. In order to effectively address this challenge,
+we require certain assumption that restricts the number of rounds in which the expected
+rewards of two arms can become arbitrarily small. This assumption is necessary to ensure
+that the arms’ expected rewards remain distinguishable and prevent the algorithm from
+being overwhelmed by the inherent uncertainty in the rewards. Let ∆ ∈ (0,1), define
+H(∆,T) = {t ∈ {1,...,T} : ∃i (cid:54)= j,|µ (t)−µ (t)| < ∆}
+i j
+and we make the following assumption.
+Assumption 2. There exist some constant independent of T, β ∈ [0,1], positive number
+F, ∆ ∈ (0,1), s.t. for all ∆ < ∆ ,
+0 0
+|H(∆,T)| ≤ F∆Tβ
+This assumption is consistent with (Trovo et al., 2020), and if β = 1 it’s equivalent to
+that in (Combes & Proutiere, 2014).
+Theorem 2. Let γ ∈ (1− 1
+e
+,1),τ
+max
+≥
+12
+1√
+2
+Lipschitz constant σ > 0. There exists ∆
+0
+as in Assumption 2, s.t. 2σD(γ) < ∆/3 ≤ ∆ . In the smoothly changing settings, for any
+0
+arm i ∈ {1,...,K},
+1
+E[k (i)] ≤ F∆Tβ +M(γ)T(1−γ)log( ), (2)
+T
+1−γ
+√
+144(1+ 2)2log( 1 +e25)
+where M(γ) = 1−γ (e25+13+ 1 )+ 594 .
+γ1/(1−γ)∆2 F(µmax) γ1/(1−γ)(∆/3−2σD(γ))2
+τmax
+Corollary 2. If β in Assumption 2 and the time horizon T are known in advance, the
+discounted factor can be set as γ = 1−1/T1−β, then E[k (i)] = O(Tβlog2(T)).
+T
+Remark 2. Trovo et al. (2020) discusses in detail the value of β for which Assumption 2
+holds under the conditions of Theorem 2 and Corollary 2. Define
+P = |{t ∈ {1,...,T −1} : ∃i (cid:54)= j,(µ (t)−µ (t))(µ (t+1)−µ (t+1)) < 0}|
+i j i j
+7
+as the number of times the expected rewards of a pair of arms change over the time period.
+When γ = 1 − 1/T1−β, it’s easy to get D(γ) ≤ 2T1−βlogT. We can get β need within
+(cid:113)
+[max{1−log ( ∆ ), 1 −log F∆ },1] in our setting.
+T 12σlogT 2 T 24PlogT
+6. Proofs of Upper Bounds
+In this section, we prove the results respectively. The proofs of the two settings follow a
+similar approach. The differences in the proof can be dealt with uniformly using Lemma
+1 and Lemma 3. The core framework of our proof follows (Agrawal & Goyal, 2013). We
+extend the analysis of (Agrawal & Goyal, 2013) to the non-stationary case by combining
+the method proposed in (Garivier & Moulines, 2011). The main difficulty lies in the need
+to estimate the E[ 1 ] for non-stationary settings (Lemma 2 and Lemma 4).
+pi,t
+6.1 Proofs of Theorem 1
+Proof outlines: The idea is to divide E[k (i)] into several parts according to whether
+T
+the specific events are true or not. First of all the expected rewards for all arms will not
+be well estimated in the rounds near the breakpoints, and this part can be bounded as
+B D(γ). Then focus on the rounds that are far from the breakpoints(D(γ) rounds after
+T
+the breakpoints). For the rounds in which the mean of the arm is not well estimated, the
+regret can be bounded by Lemma 6. For the rounds that the arm is fully explored, the
+regret bound can be estimated by self-normalized Hoeffding-type inequality (Garivier &
+Moulines, 2011). For the other cases, one can use Lemma 5 and thus needs to estimate
+E[ 1 ]. We derive the upper bound of E[ 1 ] for non-stationary settings, with an extra
+pi,t pi,t
+logarithmic term compared with the stationary settings.
+Before proceeding to the specific analysis, we first give some definitions and lemmas
+that will be used in both non-stationary settings.
+Definition 1 (Quantities x (i),y (i)). For arm i (cid:54)= i∗, we choose two threshold x (i),y (i)
+t t t t t
+such that x (i) = µ (i)+
+∆t(i)
+,y (i) = µ (∗)−
+∆t(i)
+. Then µ (i) < x (i) < y (i) < µ (∗) and
+t t 3 t t 3 t t t t
+y (i)−x (i) =
+∆t(i)
+.
+t t 3
+Definition 2 (µ¨ (γ,i)). µ¨ (γ,i) = 1 (cid:80)t γt−j1{i = i}µ (i) denotes the discounted
+t t Nt(γ,i) j=1 j j
+average of expectation for arm i at time step t. If the randomness of 1{i = i} is removed,
+j
+i.e., the selection of each arm is deterministic, then µ¨ (γ,i) = E[µˆ (γ,i)].
+t t
+Definition 3 (History F ). F is the squence
+t t
+F = {i ,X (i ),k = 1,...,t},
+t k k k
+where i denotes the arm played at time k, and X (i ) denotes the reward obtained at time
+k k k
+k. Define F = {}.
+0
+By definition, we know F ⊆ F ⊆ ... ⊆ F . And i ,µˆ (γ,i), the distribution of θ (i) are
+0 T t t t
+determined by the history F .
+t−1
+Now we give some additional definitions and lemmas for abruptly changing settings
+only. The abruptly changing settings is in fact piecewise-stationary. Some rounds between
+8
+two breakpoints appear to be stationary. Based on this observation, we give the following
+definition.
+Definition4(Pseudo-StationaryPhaseT(γ)). T(γ) = {t ≤ T : ∀s ∈ (t−D(γ),t],µ (·) =
+s
+µ (·)}, where D(γ) = log((1−γ)2log( 1 ))/logγ.
+t 1−γ
+Remark 3. Let S(γ) = {t ≤ T : t ∈/ T(γ)}. Note that, on the right side of any breakpoint,
+there will be D(γ) rounds belonging to S(γ). Therefore, the number of elements in the
+set S(γ) has an upper bound B D(γ), i.e. |S(γ)| ≤ B D(γ). T(γ) is called the pseudo-
+T T
+stationary phase because the length of T(γ) is smaller than the true stationary phase.
+Figure 1 shows T(γ) and S(γ) in two different situations.
+𝒮(𝛾) 𝒯(𝛾)
+𝐷 𝛾 <𝑏 −𝑏
+𝑖+1 𝑖
+𝑏 𝑏 +𝐷(𝛾) 𝑏
+𝑖 𝑖 𝑖+1
+𝒮(𝛾) 𝒯(𝛾)
+𝐷 𝛾 >𝑏 −𝑏
+𝑖+1 𝑖
+𝑏 𝑏 𝑏 +𝐷(𝛾) 𝑏 +𝐷(𝛾) 𝑏
+𝑖 𝑖+1 𝑖 𝑖+1 𝑖+2
+Figure 1: Illustration of T(γ) and S(γ) in two different situations. b − b > D(γ) is
+i+1 i
+shown in the top figure, and b −b ≤ D(γ) the bottom figure.
+i+1 i
+Unlike the Sliding window method(Garivier & Moulines, 2011; Trovo et al., 2020), µ (i)
+t
+and µ¨ (γ,i) are often not the same even in the pseudo-stable phase T(γ). The following
+t
+lemmadepictsthatafterfiniteroundsatthebreakpoint, thatis, inthepseudo-stablephase,
+the distance between µ (i) and µ¨ (γ,i) has an upper bound.
+t t
+Lemma 1. ∀t ∈ T(γ), the distance between µ (i) and µ¨ (γ,i) is less than U (γ,i).
+t t t
+|µ (i)−µ¨ (γ,i| ≤ U (γ,i), (3)
+t t t
+where
+(cid:115)
+(1−γ)log 1
+1−γ
+U (γ,i) = .
+t
+N (γ,i)
+t
+As can be seen from Definition 4, (t−D(γ),t) does not contain any breakpoints ⇐⇒
+t ∈ T(γ). For any breakpoint b ∈ {b ,...,b }, b +D(γ) ∈ T(γ) if D(γ) ≤ b −b . That
+i 1 BT i i+1 i
+is, D(γ) rounds after the breakpoint b (D(γ) ≤ b −b ), the distance between µ (i) and
+i i+1 i t
+µ¨ (γ,i) is less than U (γ,i).
+t t
+Lemma 2. Let p = P(θ (∗) > y (i)|F ). For any t ∈ T(γ) and i (cid:54)= i∗,
+i,t t t t−1 t
+(cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}] ≤ CT(1−γ)L(γ)γ−1/(1−γ)log 1 .
+p t t t t 1−γ
+i,t
+t∈T(γ)
+9
+√
+144(1+ 2)2log( 1 +e25)
+where C = e25+ 1 +12, L(γ) = 1−γ .
+F(µmax) ∆2
+τmax T
+To facilitate the analysis, we define some quantities that are independent of t.
+√
+12 2 √ (cid:112) n2log( 1− 1 γ )
+m = √ +3,n = 12 2+3 1−γ,A(γ) = ,
+1−γ (∆ )2
+T
+From the definition of U (γ,i) given in Lemma 1, we can get
+t
+(cid:115)
+∆ A(γ)
+T
+U (γ,i) = . (4)
+t
+m N (γ,i)
+t
+Now we can give the detailed proof. The proof is in 5 steps:
+Step 1 We can divide the rounds t ∈ {1,...,T} into two parts: {t ∈ T(γ)} and {t ∈/ T(γ)}.
+From Remark 3, the number of elements in the second part is smaller than B D(γ).
+T
+(cid:88)
+E[k (i)] ≤ B D(γ)+ P(i = i). (5)
+T T t
+t∈T(γ)
+Step 2 Then we consider the event {N (γ,i) > A(γ)}.
+t
+(cid:88) (cid:88) (cid:88)
+P(i = i) = P(i = i,N (γ,i) < A(γ))+ P(i = i,N (γ,i) > A(γ)).
+t t t t t
+t∈T(γ) t∈T(γ) t∈T(γ)
+We first bound (cid:80) P(i = i,N (γ,i) < A(γ)).
+t∈T(γ) t t
+(cid:88) (cid:88)
+P(i = i,N (γ,i) < A(γ)) = E[P(i = i,N (γ,i) < A(γ)|F )]
+t t t t t−1
+t∈T(γ) t∈T(γ)
+(cid:88)
+= E[E[1{i = i,N (γ,i) < A(γ)}|F ]]
+t t t−1
+t∈T(γ)
+(6)
+( = a) (cid:88) E[1{i = i,N (γ,i) < A(γ)}]
+t t
+t∈T(γ)
+(b)
+≤ T(1−γ)A(γ)γ−1/(1−γ)
+where (a) uses the tower rule for expectation, (b) follows from Lemma 6. Therefore,
+(cid:88)
+E[k (i)] ≤ T(1−γ)A(γ)γ−1/(1−γ)+B D(γ)+ P(i = i,N (γ,i) > A(γ)) (7)
+T T t t
+t∈T(γ)
+Step 3 Define E (γ,i) as the event that {i = i,N (γ,i) > A(γ)}. Define Eθ(i) as the event
+t t t t
+that θ (i) < y (i). This part may be decomposed as follows:
+t t
+(cid:88) (cid:88) (cid:88)
+P(E (γ,i)) = P(E (γ,i),µˆ (γ,i) > x (i))+ P(E (γ,i),µˆ (γ,i) < x (i),Eθ(i))
+t t t t t t t t
+t∈T(γ) t∈T(γ) t∈T(γ)
+(cid:88)
++ P(E (γ,i),µˆ (γ,i) < x (i),Eθ(i))
+t t t t
+t∈T(γ)
+(8)
+10
+Next, we bound the first part by Lemma 7.
+(cid:88)
+P(E (γ,i),µˆ (γ,i) > x (i))
+t t t
+t∈T(γ)
+≤ (cid:88) P(µˆ t (γ,i) > µ t (i)+ ∆ t (i) ,N t (γ,i) > A(γ)) (9)
+3
+t∈T(γ)
+1
+≤ T(1−γ)48log
+1−γ
+Step 4 Then we bound the second part.
+(cid:88)
+P(E (γ,i),µˆ (γ,i) < x (i),Eθ(i))
+t t t t
+t∈T(γ)
+(cid:88)
+= E[ E[1{i = i,N (γ,i) > A(γ),µˆ (γ,i) < x (i),Eθ(i)}|F ]]
+t t t t t t−1
+t∈T(γ)
+(10)
+( = c) E[ (cid:88) 1{N (γ,i) > A(γ),µˆ (γ,i) < x (i)}P(i = i,Eθ(i)|F )]
+t t t t t t−1
+t∈T(γ)
+(cid:88)
+≤ E[ 1{N (γ,i) > A(γ),µˆ (γ,i) < x (i)}P(θ (i) > y (i)|F )],
+t t t t t t−1
+t∈T(γ)
+where(c)usesthefactthatN (γ,i)andµˆ (i)aredeterminedbythehistoryF .Therefore,
+t t t−1
+given the history F such that N (γ,i) > A(γ) and µˆ (γ,i) < x (i), we have
+t−1 t t t
+∆ 1 (∆ )2A(γ) 1
+P(θ (i) > y (i)|F )) ≤ P(θ (i)−µˆ (γ,i) > T |F )) ≤ exp(− T ) ≤ (1−γ)16.
+t t t−1 t t t−1
+3 2 18 2
+For other F , the indicator term 1{N (γ,i) > A(γ),µˆ (γ,i) < x (i)} will be 0. Hence, we
+t−1 t t t
+can bound the second part by
+(cid:88) T
+P(E (γ,i),µˆ (γ,i) < x (i),Eθ(i)) ≤ (1−γ)16
+t t t t 2
+t∈T(γ)
+Step 5 Finally, using Lemma 2,
+(cid:88) P(E (γ,i),µˆ (γ,i) < x (i),Eθ(i)) ≤ (cid:88) E[ 1−p i,tP(i = i∗,Eθ(i)|F )]
+t t t t t t t t−1
+p
+i,t
+t∈T(γ) t∈T(γ)
+( = d) (cid:88) E[E[ 1−p i,t1{i = i∗,Eθ(i)}|F ]]
+t t t t−1
+p
+i,t
+t∈T(γ)
+= (cid:88) E[ 1−p i,t1{i = i∗,Eθ(i)}]
+t t t
+p
+i,t
+t∈T(γ)
+1
+≤ CT(1−γ)L(γ)γ−1/(1−γ)log .
+1−γ
+where (d) uses the fact that p is fixed given F ,
+i,t t−1
+11
+Substituting the results in Step 3-5 to Equation (8) and Equation (7),
+(cid:88)
+E[k (i)] ≤ T(1−γ)A(γ)γ−1/(1−γ)+B D(γ)+ P(i = i,N (γ,i) > A(γ))
+T T t t
+t∈T(γ)
+1
+≤ T(1−γ)A(γ)γ−1/(1−γ)+B D(γ)+T(1−γ)log
+T
+1−γ
+1
++CT(1−γ)L(γ)γ−1/(1−γ)log
+1−γ
+1
+≤ B D(γ)+(C +2)L(γ)γ−1/(1−γ)T(1−γ)log .
+T
+1−γ
+6.2 Proofs of Theorem 2
+The proof of Theorem 2 is similar to Theorem 1. The main difference is that there is
+no pseudo-stationary phase under smoothly changing settings. Fortunately, conclusions
+(Lemma 3,Lemma 4) similar to Lemma 1 and Lemma 2 still hold.
+Recall that
+(cid:115)
+(1−γ)log 1 log((1−γ)2log( 1 ))
+1−γ 1−γ
+U (γ,i) = ,D(γ) = ,
+t
+N (γ,i) logγ
+t
+√
+12 2 √ (cid:112)
+m = √ +3,n = 12 2+3 1−γ
+1−γ
+Lemma 3. For any t and σ satisfies Assumption 1,
+|µ (i)−µ¨ (γ,i| ≤ U (γ,i)+σD(γ), (11)
+t t t
+Lemma 4. Let p = P(θ (∗) > y (i)−σD(γ)|F ). For any i (cid:54)= i∗,
+i,t t t t−1 t
+T
+(cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)−σD(γ)}] ≤ CT(1−γ)L(γ)γ−1/(1−γ)log 1 .
+p t t t t 1−γ
+i,t
+t=1
+√
+144(1+ 2)2log( 1 +e25)
+where C = e25+ 1 +12, L(γ) = 1−γ .
+F(µmax) ∆2
+τmax
+We redefine A(γ) in smoothly changing settings as
+n2log( 1 )
+1−γ
+A(γ) = .
+(∆/3−2σD(γ))2
+Since there is no pseudo-stationary phase, the proof is only need divide into four steps.
+Step 1 The first step is exactly the same as the step 2 of Theorem 1, so we can get the
+folowing directly:
+T
+(cid:88)
+E[k (i)] ≤ F∆Tβ +T(1−γ)A(γ)γ−1/(1−γ)+ P(i = i,N (γ,i) > A(γ)) (12)
+T t t
+t=1
+12
+Step 2 Define E (γ,i) as the event that {i = i,N (γ,i) > A(γ)}. Then
+t t t
+T T
+(cid:88) (cid:88)
+P(E (γ,i)) = P(E (γ,i),µˆ (γ,i) > x (i)+σD(γ))
+t t t t
+t=1 t=1
+T
+(cid:88)
++ P(E (γ,i),µˆ (γ,i) < x (i)+σD(γ),θ (i) > y (i)−σD(γ)) (13)
+t t t t t
+t=1
+T
+(cid:88)
++ P(E (γ,i),µˆ (γ,i) < x (i)+σD(γ),θ (i) < y (i)−σD(γ))
+t t t t t
+t=1
+The first part can be bounded by Lemma 7,
+T
+(cid:88) 1
+P(E (γ,i),µˆ (γ,i) > x (i)+σD(γ)) ≤ T(1−γ)48log
+t t t
+1−γ
+t=1
+Step 3 The second part can be bounded through a similar method as Equation (10).
+T
+(cid:88)
+P(E (γ,i),µˆ (γ,i) < x (i)+σD(γ),θ (i) > y (i)−σD(γ))
+t t t t t
+t=1
+(14)
+T
+(cid:88)
+≤ E[ 1{N (γ,i) > A(γ),µˆ (γ,i) < x (i)+σD(γ)}P(θ (i) > y (i)−σD(γ)|F )]
+t t t t t t−1
+t=1
+Given the history F such that N (γ,i) > A(γ) and µˆ (γ,i) < x (i)+σD(γ), we have
+t−1 t t t
+∆
+P(θ (i) > y (i)−σD(γ)|F )) ≤ P(θ (i)−µˆ (γ,i) > −2σD(γ)|F ))
+t t t−1 t t t−1
+3
+1 (∆/3−2σD(γ))2A(γ)
+≤ exp(− )
+2 2
+1
+≤ (1−γ)144.
+2
+For other F , the indicator term 1{N (γ,i) > A(γ),µˆ (γ,i) < x (i)+σD(γ)} will be 0.
+t−1 t t t
+Hence, we can bound the second part by T(1−γ)144.
+2
+Step 4 Using Lemma 4, we can get
+T
+(cid:88)
+P(E (γ,i),µˆ (γ,i) < x (i)+σD(γ),θ (i) < y (i)−σD(γ))
+t t t t t
+t=1
+1
+≤ CT(1−γ)L(γ)γ−1/(1−γ)log .
+1−γ
+Substituting all into Equation (12), we can obtain the statement of Theorem 2.
+13
+7. Experiments
+Inthissection, weempiricallycomparetheperformanceofDS-TSw.r.t. thestate-of-the-art
+algorithms on Bernoulli and an arbitrarily generated bounded reward distributions. Specif-
+ically, we compare DS-TS with Thompson Sampling (TS)(Thompson, 1933) to evaluate
+the improvement obtained thanks to the employment of the discounted factor γ. We also
+compare DS-TS with SW-TS (Trovo et al., 2020) to evaluate the performance of sliding
+window and discounted factor. Furthermore, we compare DS-TS with another discounted
+method, DS-UCB (Garivier & Moulines, 2011), to evaluate the effect of Thompson Sam-
+pling and UCB. Moreover, we compare DS-TS with some novel and efficient algorithms
+such as CUSUM (Liu et al., 2018), M-UCB (Cao et al., 2019) and LB-SDA (Baudry et al.,
+2021). We measure the performance of each algorithm with the cumulative expected regret
+defined in Equation (1). The expected regret is averaged on 100 independently runs. The
+95% confidence interval is obtained by performing 100 independent runs and is shown as a
+semi-transparent region in the figure.
+7.1 Abruptly Changing Settings
+ExperimentalSetting ThetimehorizonissetasT = 100000. Wesplitthetimehorizon
+into5,10,20phasesofequallengthanduseanumberofarmsK = {5,10,20,30},respectively.
+We only show the results of some of the experimental settings, one can run the code on
+online website to get more results1.
+1.0
+0.8
+0.6
+0.4
+0.2
+0.0
+0 20000 40000 60000 80000 100000
+Roundt
+)i(tµ
+Arm1
+Arm2
+Arm3
+Arm4
+Arm5
+Figure 2: K = 5,B = 10 for Bernoulli rewards.
+T
+At each breakpoint, the expected value µ (i) of each arm i is drawn from a uniform
+t
+distributionover[0,1]. Inthestationaryphase,therewardsdistributionsremainunchanged.
+The Bernoulli arms for each phase are generated as µ (i) ∼ U(0,1). Figure 2 depicts the
+t
+expected rewards for Bernoulli arms with K = 5 and B = 10.
+T
+(cid:112)
+Based on Corollary 1, we set γ = 1− B /T. τ is an important parameter that
+T max
+not only ensures the exploration ability of the algorithm but also prevents the sampling
+1. Our code is available at https://github.com/qh1874/nonmab
+14
+deviating too much from the arm’s expectation. τ is generally 1/5−1/3 of the upper
+max
+bound of the expected rewards. In this experiment, the upper bound of expected rewards
+µ = 1, we take τ as 1/5. To allow for fair comparison, DS-UCB uses the discount
+max max
+(cid:112)
+factor γ = 1 − B /T/4,B = 1,ξ = 2/3 suggested by Garivier and Moulines (2011).
+T
+(cid:112)
+Based on (Baudry et al., 2021), we set τ = 2 T log(T)/B for LB-SDA and SW-TS. For
+T
+(cid:112)
+changepoint detection algorithm M-UCB, we set w = 800,b = w/2log(2KT2) suggested
+(cid:112)
+by Cao et al. (2019). But set the amount of exploration γ = KB log(T)/T. In practice,
+T
+it has been found that using this value instead of the one guaranteed in (Cao et al., 2019)
+will improve empirical performance (Baudry et al., 2021). For CUSUM, following from
+(cid:112)
+(Liu et al., 2018), we set α = B /T log(T/B ) and h = log(T/B ). For our experiment
+T T T
+settings, we choose M = 50,(cid:15) = 0.05. Based on (Auer et al., 2002), the parameters α and
+(cid:112)
+γ for EXP3S are set as follows: α = 1/T,γ = min(1, K(e+B log(KT)/((e−1)T))).
+T
+20000
+17500
+15000
+12500
+10000
+7500
+5000
+2500
+0
+0 20000 40000 60000 80000 100000
+Roundt
+tergeR
+EXP3S
+SW-LB-SDA 25000
+CUSUM
+DS-UCB
+M-UCB 20000
+TS
+SW-TS
+DS-TS
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Roundt
+(a)
+tergeR
+EXP3S
+SW-LB-SDA
+CUSUM
+DS-UCB
+M-UCB
+TS
+SW-TS
+DS-TS
+(b)
+25000
+20000
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Round t
+tergeR
+35000
+EXP3S
+SW-LB-SDA
+CUSUM 30000
+DS-UCB
+M-UCB 25000
+TS
+SW-TS
+DS-TS 20000
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Round t
+(c)
+tergeR
+EXP3S
+SW-LB-SDA
+CUSUM
+DS-UCB
+M-UCB
+TS
+SW-TS
+DS-TS
+(d)
+Figure 3: Abruptly changing settings. Settings with K = 5,B = 10 (a), K = 10,B = 10
+T T
+(b), K = 20,B = 10 (c) and K = 30,B = 10 (d).
+T T
+Results Figure 3 report the results for Bernoulli arms in abruptly changing settings. It
+canbeobservedthatourmethodandSW-TShasalmostthesameperformance. Thompson
+Sampling (TS) is an algorithm for stationary MAB problems, so it oscillates a lot at the
+15
+breakpoint. The changepoint detection algorithm CUSUM also shows competitive perfor-
+mance. Note that, our experiment does not satisfy the detectability assumption of CUSUM
+(Liu et al., 2018). When the number of arms are large, several algorithms, such as EXP3S
+and DS-UCB, have a near-linear regret, while our algorithm still performs well. While two
+TS-based algorithms, DS-TS and SW-TS, still work well. This is consistent with the results
+in (Bayati, Hamidi, Johari, & Khosravi, 2020): when the number of arms is relatively large,
+algorithms based on TS are often better than that of UCB-class algorithms.
+2500
+2000
+1500
+1000
+500
+0.00 0.05 0.10 0.15 0.20 0.25 0.30
+T
+tergeR
+DS-TS 3000
+DS-UCB
+CUSUM
+SW-TS 2500
+2000
+1500
+1000
+500
+0.00 0.05 0.10 0.15 0.20 0.25 0.30
+T
+(a)
+tergeR
+DS-TS
+DS-UCB
+CUSUM
+SW-TS
+(b)
+8000
+7000
+6000
+5000
+4000
+3000
+2000
+1000
+0.00 0.05 0.10 0.15 0.20 0.25 0.30
+T
+tergeR
+DS-TS
+DS-UCB
+CUSUM
+SW-TS 8000
+6000
+4000
+2000
+0.00 0.05 0.10 0.15 0.20 0.25 0.30
+T
+(c)
+tergeR
+DS-TS
+DS-UCB
+CUSUM
+SW-TS
+(d)
+Figure 4: ∆ along with regret. Settings with K = 2,B = 5 (a), K = 2,B = 10 (b),
+T T T
+K = 5,B = 5 (c) and K = 5,B = 10 (d).
+T T
+Impact of ∆ The regret upper bound of DS-TS as well as CUSUM, DS-UCB and
+T
+SW-TS, all depend on ∆ . In order to more clearly analyze the impact of ∆ on the
+T T
+performance, we consider the environment: K = {2,5},B = {5,10},T = 100000. We
+T
+let ∆ vary within the interval (0,0.3), and compare the regrets of CUSUM, DS-UCB,
+T
+SW-TS and DS-TS. As shown in Figure 4, the performance of CUSUM and SW-TS is less
+significantly affected by ∆ . The reason behind this phenomenon is that their regret upper
+T
+bound have different factors about ∆ . Their regret upper bounds are shown in Table
+T
+7.1. As can be seen from the table, the upper bound of CUMSUM with respect to ∆ is
+T
+16
+only related to B . The upper bound of SW-TS has factor 1 , while DS-UCB and DS-
+T ∆T
+TS have factor 1 . However, DS-UCB and DS-TS also have smaller regret when ∆ is
+(∆T)2 T
+small, as∆ increases, theregretvalueincreasesfirstandthentendstodecreaseorstabilize
+T
+gradually. Thisisbecausewhen∆ isverysmall,althoughthealgorithmcannotdistinguish
+T
+the optimal arm from the suboptimal arms well, the regret of choosing the suboptimal arm
+is small enough.
+Table 1: Comparison of regret bounds related to ∆ in various algorithms
+T
+Algorithm CUMSUM SW-TS DS-UCB DS-TS
+√ √ √ √
+Bound O˜( BT + TB ) O˜( TBT) O˜( TBT) O˜( TBT)
+(∆T)2 T ∆T (∆T)2 (∆T)2
+7.2 Smoothly Changing Settings
+Experimental Setting We use a number of arms K = {5,10,20,30} and the time horizon
+is set as T = {104,105}. The smoothly changing setting we use is the same as (Trovo et al.,
+2020) and (Combes & Proutiere, 2014), where the expected reward changing periodically
+according to the following function:
+K −1 |w(t)−i|
+µ (i) = −
+t
+K K
+(15)
+(K −1)(1+sin(tσ))
+w(t) = 1+
+2
+The expected value generated from Equation (15) clearly satisfies Assumption 1. Trovo
+et al. (2020) have shown that F = 4K ,∆ = 1 satisfies Assumption 2 regardless of the
+σ(K−1) 0 3
+value of β.
+0.8
+0.7
+0.6
+0.5
+0.4
+0.3
+0.2
+0.1
+0.0
+0 2000 4000 6000 8000 10000
+Roundt
+)i(tµ
+0.8
+0.7
+0.6
+0.5
+0.4
+0.3
+Arm1
+Arm2 0.2
+Arm3
+Arm4 0.1
+Arm5
+0 2000 4000 6000 8000 10000
+Roundt
+(a)
+)i(tµ
+Arm1
+Arm2
+Arm3
+Arm4
+Arm5
+(b)
+Figure 5: Instances of expected rewards change over the time. Settings with K = 5,T =
+104,σ = 0.001 (a), K = 5,T = 104,σ = 0.0001 (b).
+Unlike the abruptly changing settings, we do not compare the CUMSUM and M-UCB
+algorithms. Both algorithms use the opposite assumption to Assumption 1 to guarantee
+17
+detectability. Let B = 1(i.e. b = 1, this means there is no breakpoint), other algorithms
+T 1
+includingoursusethesameparameterasabruptlychangingsettings. Sincewewanttogeta
+√
+regret for O˜( T), in this experiment we set β = 1. Corollary 2 suggests taking γ = 1−√1 ,
+2 T
+in this experiment we take γ = 1 − √10 to ensure that the conditions of Theorem 2 are
+T
+satisfied. In particular, if T = 104,σ = 0.001 or T = 105,σ = 0.0001, γ = 1− √10 satisfies
+T
+Theorem 2 while γ = 1−√1 not. Figure 5 shows two instances of smoothly changing arms.
+T
+2500
+2000
+1500
+1000
+500
+0
+0 2000 4000 6000 8000 10000
+Roundt
+tergeR
+EXP3S 1600
+SW-LB-SDA
+DS-UCB 1400
+TS
+SW-TS 1200
+DS-TS
+1000
+800
+600
+400
+200
+0
+0 2000 4000 6000 8000 10000
+Roundt
+(a)
+tergeR
+EXP3S
+SW-LB-SDA
+DS-UCB
+TS
+SW-TS
+DS-TS
+(b)
+20000
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Roundt
+tergeR
+EXP3S SW-LB-SDA 25000
+DS-UCB
+TS
+SW-TS 20000
+DS-TS
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Roundt
+(c)
+tergeR
+EXP3S SW-LB-SDA
+DS-UCB
+TS
+SW-TS
+DS-TS
+(d)
+Figure 6: Smoothly changing settings. Settings with K = 5,T = 104,σ = 0.001 (a), K =
+5,T = 104,σ = 0.0001 (b), K = 5,T = 105,σ = 0.0001 (c) and K = 10,T =
+105,σ = 0.0001 (d).
+Results
+Figure 6 report the results for smoothly changing settings. It can be seen that SW-TS
+and SW-LB-SDA achieve similar performance in several environmental settings. Due to the
+extra logarithmic regret induced by the discounted method while adapting to changes in
+the reward, the performance of DS-TS is not as potent as that of SW-TS and SW-LB-SDA.
+However, when T = 104,σ = 0.0001, Thompson Sampling exhibits excellent performance.
+18
+The reason for this phenomenon can be explained by Figure 5(b). In this environment the
+optimal arm is switched only twice and the difference between the optimal arm and the
+second best arm is not significant.
+7.3 Prior Knowledge of µ
+max
+Theexpectationofarminourexperimentisuniformlysampledfrom(0,1). Forareasonable
+number of arms, at least one of the arms has a expected value close to 1. Most of the
+algorithms based on UCB and TS perform well due to their strong exploration ability. Now
+we change the experimental settings so that the expectation of the arms are relatively small
+and test the performance of each algorithm.
+In abruptly changing settings, we limit the maximum expectation of the arms to less
+than0.7. Insmoothlychangingsettings,welimitthemaximumexpectationtolessthan0.5.
+To this end, we modify the expected arms generation function (15) as µ (i) = K µ (i).
+t 2(K−1) t
+We test the performance of each algorithm using the same parametrer as before except
+DS-TS. We test DS-TS with τ = 1/5 and τ = µ /5 respectively. The latter means
+max max max
+DS-TS has additional information about µ .
+max
+20000
+15000
+10000
+5000
+0
+0 20000 40000 60000 80000 100000
+Roundt
+tergeR
+EXP3S 1600
+SW-LB-SDA
+CUSUM 1400
+DS-UCB
+M-UCB
+TS 1200
+SW-TS
+DS-TS 1000
+DS-TS(knownµmax)
+800
+600
+400
+200
+0
+0 2000 4000 6000 8000 10000
+Roundt
+(a)
+tergeR
+EXP3S
+SW-LB-SDA
+DS-UCB
+TS
+SW-TS
+DS-TS
+DS-TS(knownµmax)
+(b)
+Figure 7: (a) Abruptly changing settings with expected value less than 0.7. Settings with
+K = 10,B = 10,T = 105. (b) Smoothly changing settings with expected value
+T
+less than 0.5. Settings with K = 5,T = 104,σ = 0.001.
+Figure 7 shows the performance of each algorithm with small expected reward. First,
+a comparison of Figure 3(b) shows that the regret values for each algorithm are larger
+than the case where the expected rewards are sampled uniformly from (0,1). In smoothly
+changingsettings,theexpectedrewardwasscaleddown,meaningthattherewardofthearm
+changed more slowly. Comparison with Figure 1 reveal that the regret of each algorithm
+even decreased except for DS-TS. This suggests that DS-TS is more influenced by µ
+max
+than the other algorithms. Second, if the µ is known in advance and the τ of DS-TS
+max max
+is reset to µ /5, the performance of DS-TS will be significantly improved.
+max
+19
+8. Discussion
+In this paper, we have proposed DS-TS algorithm with Gaussian priors for abruptly chang-
+ing and smoothly changing MAB problems. Under mild assumptions, we provide the regret
+upperboundsof DS-TSin both non-stationarysettings. Ourexperiments show thatDS-TS
+can achieve significant regret reduction with respect to the state-of-the-art algorithms when
+the µ is known in advance. Furthermore, we empirically analyze the influence of ∆ on
+max T
+the performance of different algorithms.
+However, there are still some shortcomings in our work. First, the performance of DS-
+TS is usually similar to that of SW-TS in abruptly changing settings, but the regret upper
+bound of DS-TS has an extra logarithmic term logT, which is probably due to the fact
+that our analysis method yields a too rough upper bound. Second, it’s natural to use the
+Bernoullipriorforboundedrewards. AsN (γ,i)isnolongerapositiveintegerindiscounted
+t
+method,therelationshipbetweenbinomialdistributionandbetadistributioncannotbeused
+for analysis. According to the literature on tail bounds of the beta distribution (Zhang &
+Zhou, 2020), the method in this paper cannot be used to analyze DS-TS with Bernoulli
+priors. Addressing these shortcomings could be a future research direction.
+References
+Abramowitz,M.,&Stegun,I.A.(1964). Handbookofmathematicalfunctionswithformulas,
+graphs, and mathematical tables, Vol. 55. US Government printing office.
+Agrawal, S., & Goyal, N. (2013). Further optimal regret bounds for thompson sampling. In
+Artificial intelligence and statistics, pp. 99–107. PMLR.
+Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). The nonstochastic mul-
+tiarmed bandit problem. SIAM journal on computing, 32(1), 48–77.
+Auer, P., Gajane, P., & Ortner, R. (2019). Adaptively tracking the best bandit arm with
+an unknown number of distribution changes. In Conference on Learning Theory, pp.
+138–158. PMLR.
+Baudry, D., Russac, Y., & Capp´e, O. (2021). On limited-memory subsampling strategies
+for bandits. In International Conference on Machine Learning, pp. 727–737. PMLR.
+Bayati, M., Hamidi, N., Johari, R., & Khosravi, K. (2020). Unreasonable effectiveness
+of greedy algorithms in multi-armed bandit with many arms. Advances in Neural
+Information Processing Systems, 33, 1713–1723.
+Besbes, O., Gur, Y., & Zeevi, A. (2014). Stochastic multi-armed-bandit problem with non-
+stationary rewards. Advances in neural information processing systems, 27.
+Besson, L., Kaufmann, E., Maillard, O.-A., & Seznec, J. (2022). Efficient change-point
+detection for tackling piecewise-stationary bandits. Journal of Machine Learning Re-
+search, 23(77), 1–40.
+Bouneffouf, D., Bouzeghoub, A., & Ganarski, A. L. (2012). A contextual-bandit algorithm
+for mobile context-aware recommender system. In International conference on neural
+information processing, pp. 324–331. Springer.
+20
+Cao, Y., Wen, Z., Kveton, B., & Xie, Y. (2019). Nearly optimal adaptive procedure with
+change detection for piecewise-stationary bandit. In The 22nd International Confer-
+ence on Artificial Intelligence and Statistics, pp. 418–427. PMLR.
+Chen, Y., Lee, C.-W., Luo, H., & Wei, C.-Y. (2019). A new algorithm for non-stationary
+contextual bandits: Efficient, optimal and parameter-free. In Conference on Learning
+Theory, pp. 696–726. PMLR.
+Combes, R., & Proutiere, A. (2014). Unimodal bandits: Regret lower bounds and optimal
+algorithms. In International Conference on Machine Learning, pp. 521–529. PMLR.
+Garivier, A., & Moulines, E. (2011). On upper-confidence bound policies for switching
+bandit problems. In International Conference on Algorithmic Learning Theory, pp.
+174–188. Springer.
+Kocsis,L.,&Szepesv´ari,C.(2006). Discounteducb. In2nd PASCAL Challenges Workshop,
+Vol. 2, pp. 51–134.
+Li,L.,Chu,W.,Langford,J.,&Wang,X.(2011). Unbiasedofflineevaluationofcontextual-
+bandit-based news article recommendation algorithms. In Proceedings of the fourth
+ACM international conference on Web search and data mining, pp. 297–306.
+Li, S., Karatzoglou, A., & Gentile, C. (2016). Collaborative filtering bandits. In Proceedings
+of the 39th International ACM SIGIR conference on Research and Development in
+Information Retrieval, pp. 539–548.
+Liu, F., Lee, J., & Shroff, N. (2018). A change-detection based framework for piecewise-
+stationary multi-armed bandit problem. In Proceedings of the AAAI Conference on
+Artificial Intelligence.
+Mellor, J., & Shapiro, J. (2013). Thompson sampling in switching environments with
+bayesian online change detection. In Artificial intelligence and statistics, pp. 442–
+450. PMLR.
+Raj, V., & Kalyani, S. (2017). Taming non-stationary bandits: A bayesian approach. arXiv
+preprint arXiv:1707.09727.
+Robbins, H. (1952). Some aspects of the sequential design of experiments. Bulletin of the
+American Mathematical Society, 58(5), 527–535.
+Schwartz, E. M., Bradlow, E. T., & Fader, P. S. (2017). Customer acquisition via display
+advertising using multi-armed bandit experiments. Marketing Science, 36(4), 500–
+522.
+Suk, J., & Kpotufe, S. (2022). Tracking most significant arm switches in bandits. In
+Conference on Learning Theory, pp. 2160–2182. PMLR.
+Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another
+in view of the evidence of two samples. Biometrika, 25(3-4), 285–294.
+Trovo,F.,Paladino,S.,Restelli,M.,&Gatti,N.(2020). Sliding-windowthompsonsampling
+for non-stationary settings. Journal of Artificial Intelligence Research, 68, 311–364.
+Wu, Q., Iyer, N., & Wang, H. (2018). Learning contextual bandits in a non-stationary
+environment. In The 41st International ACM SIGIR Conference on Research & De-
+velopment in Information Retrieval, pp. 495–504.
+21
+Zhang, A. R., & Zhou, Y. (2020). On the non-asymptotic and sharp lower tail bounds of
+random variables. Stat, 9(1), e314.
+22
+Appendix A. Facts and Lemmas
+The following inequality is the anti-concentration and concentration bound for Gaussian
+distributed random variables.
+Fact 1 ((Abramowitz & Stegun, 1964)). For a Gaussian distributed random variable X
+with mean µ and variance σ2, for any a > 0
+1 a 1
+√ e−a2/2 ≤ P(X −µ > aσ) ≤ √ e−a2/2
+2π1+a2 a+ a2+4
+The following lemma is adapted from (Agrawal & Goyal, 2013) and is often used in the
+analysis of Thompson Sampling, can transform the probability of selecting the ith arm into
+the probability of selecting the optimal arm i∗.
+t
+Lemma 5. Let p = P(θ (∗) > y (i)|F ). For any A > 0, i (cid:54)= i∗,
+i,t t t t−1 t
+(1−p )
+P(i = i,θ (i) < y (i)|F ) ≤ i,t P(i = i∗,θ (i) < y (i)|F )
+t t t t−1 t t t t t−1
+p
+i,t
+Lemma 6 ((Garivier & Moulines, 2011)). For any i ∈ {1,...,K}, γ ∈ (0,1) and A > 0,
+T
+(cid:88)
+1{i = i,N (γ,i) < A} ≤ (cid:100)T(1−γ)(cid:101)Aγ−1/(1−γ).
+t t
+t=1
+Lemma 7. For abruptly changing settings,
+∆ (i) 1
+P(µˆ (γ,i) > µ (i)+ t ,N (γ,i) > A(γ)) ≤ (1−γ)48log
+t t t
+3 1−γ
+For smoothly changing settings,
+∆ (i) 1
+P(µˆ (γ,i) > µ (i)+ t +σD(γ),N (γ,i) > A(γ)) ≤ (1−γ)48log
+t t t
+3 1−γ
+√ √ √
+Proof. Recall that, m = √ 12 2 +3,n = 12 2+3 1−γ. In the abruptly changing settings,
+1−γ
+n2log( 1 )
+A(γ) = 1−γ . We have
+(∆T)2
+∆ (i)
+P(µˆ (γ,i) > µ (i)+ t ,N (γ,i) > A(γ))
+t t t
+3
+∆ (i)
+= P(µˆ (γ,i)−µ¨ (γ,i) > µ (i)+ t −µ¨ (γ,i),N (γ,i) > A(γ))
+t t t t t
+3
+(a) N (γ,i)(µˆ (γ,i)−µ¨ (γ,i)) N (γ,i) ∆
+≤ P( t t t > t ( T −U (γ,i)),N (γ,i) > A(γ))
+(cid:112) (cid:112) t t
+N (γ2,i) N (γ2,i) 3
+t t
+( ≤ b) P( N t (γ,i)(µˆ t (γ,i)−µ¨ t (γ,i)) > ( 1 − 1 )∆ (cid:112) A(γ)) (16)
+(cid:112) T
+N (γ2,i) 3 m
+t
+(c) log 1 1 1 η2
+≤ 1−γ exp(−2(( − )∆ )2A(γ)(1− ))
+T
+log(1+η) 3 m 16
+log 1 1 η2
+1−γ
+≤ exp(−64log( )(1− ))
+log(1+η) 1−γ 16
+23
+where (a) uses Lemma 1, (b) follows from N (γ,i) > N (γ2,i),∆ < ∆ (i) and Equation
+t t T t
+(4), (c) uses the self-normalized Hoeffding-type inequality(Garivier & Moulines, 2011). Let
+η = 2, we can obtain the statement for abruptly changing settings.
+For smoothly changing settings,
+∆ (i)
+P(µˆ (γ,i) > µ (i)+ t +σD(γ),N (γ,i) > A(γ))
+t t t
+3
+∆ (i)
+= P(µˆ (γ,i)−µ¨ (γ,i) > µ (i)+ t +σD(γ)−µ¨ (γ,i),N (γ,i) > A(γ))
+t t t t t
+3
+(d) N (γ,i)(µˆ (γ,i)−µ¨ (γ,i)) N (γ,i) ∆ (17)
+≤ P( t t t > t ( −U (γ,i)),N (γ,i) > A(γ))
+(cid:112) (cid:112) t t
+N (γ2,i) N (γ2,i) 3
+t t
+log 1 1 η2
+1−γ
+≤ exp(−64log( )(1− ))
+log(1+η) 1−γ 16
+where (d) uses the Lemma 3. Let η = 2, we obtain the conclusion.
+Appendix B. Proofs of Lemmas
+B.1 Proof of Lemma 1
+Let M (γ,i) = (cid:80)t γt−jµ (i)1{i = i}, µ¨ (γ,i) = Mt(γ,i) ∈ [0,1] is a convex combination
+t j=1 j j t Nt(γ,i)
+of elements µ (i),j = 1,...,t. For t ∈ T(γ),
+j
+1
+|µ (i)−µ¨ (γ,i)| = |M (γ,i)−µ (i)N (γ,i)|
+t t t t t
+N (γ,i)
+t
+t−D(γ)
+1 (cid:88)
+= | γt−j(µ (i)−µ (i))1{i = i}|
+j t j
+N (γ,i)
+t
+j=1
+t−D(γ)
+1 (cid:88)
+≤ γt−j1{i = i}
+j
+N (γ,i)
+t
+j=1
+1
+= γD(γ)N (γ,i)
+t−D(γ)
+N (γ,i)
+t
+(a) γD(γ)
+≤
+N (γ,i)(1−γ)
+t
+(cid:115)
+(b) γD(γ)
+≤ ,
+N (γ,i)(1−γ)
+t
+where (a) follows from N (γ,i) ≤ 1 , (b) follows from |µ (i) − µ¨ (γ,i)| ≤ 1 and
+√ t−D(γ) 1−γ t t
+1∧x ≤ x. By the definition of D(γ),
+(cid:115)
+−(1−γ)log(1−γ)
+|µ (i)−µ¨ (γ,i)| ≤
+t t
+N (γ,i)
+t
+24
+B.2 Proof of Lemma 2
+(cid:114)
+n2log( 1 ) (1−γ)log 1
+Recall that p = P(θ (∗) > y (i)|F ),A(γ) = 1−γ ,U (γ,i) = 1−γ,m =
+√
+i,t
+√
+t
+√
+t t−1 (∆T)2 t Nt(γ,i)
+√ 12 2 +3,n = 12 2+3 1−γ, function F(x) = √1 x e−x2/2.
+1−γ 2π1+x2
+Our algorithm uses Gaussian priors θ (i) ∼ N(µˆ (i),min{ 1 ,τ2 }).
+t t Nt(γ,i) max
+If N (γ,i) < 1 , then θ (i) is sampling from N(µˆ (i),τ2 ). We have
+t τ2 t t max
+max
+p = P(θ (∗) > y (i)|F ) ≥ P(θ (∗)−µˆ (∗) > µ (∗)|F ) ≥ P(θ (∗)−µˆ (∗) > µ |F )
+i,t t t t−1 t t t t−1 t t max t−1
+Using Fact 1, p
+i,t
+> √1
+2π1+
+µ
+(µ
+m
+m
+a
+a
+x
+x
+/
+/
+τ
+τ
+m
+m
+a
+a
+x
+x)2
+e−(µmax/τmax)2/2 = F( µ
+τm
+m
+a
+a
+x
+x). Note that τ
+max
+>
+12
+1√
+2
+,
+then N (γ,∗) < 1 ≤ A(γ). Therefore,
+t τ2
+max
+(cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}] ≤ (cid:88) 1 E[1{i = i∗,N (γ,∗) < A(γ)}]
+p
+t t t t
+F(
+µmax) t t t
+t∈T(γ) i,t t∈T(γ) τmax
+1
+≤ T(1−γ)A(γ)γ−1/(1−γ)
+F(
+µmax)
+τmax
+Inthesubsequentanalyses,wecanassumethatN (γ,i) > 1 ,i.e. θ (i) ∼ N(µˆ (i), 1 ).
+t τ
+m
+2
+ax
+t t Nt(γ,i)
+The subsequent proof is in 3 steps.
+Step 1 We first prove that E[ 1 ] has an upper bound independent of t.
+pi,t
+Define a Bernoulli experiment as sampling from N(µˆ (i), 1 ), where success implies
+t Nt(γ,i)
+that θ (i) > y (i). Let G denote the number of experiments performed when the event
+t t t
+{θ (i) > y (i)} first occurs. Then
+t t
+1
+E[ ] = E[E[G |F ]] = E[G ]
+t t−1 t
+p
+i,t
+√
+Let z = logr + 1 (r ≥ 1 is an integer ) and let MAX denote the maximum of r
+r
+independent Bernoulli experiment. Then
+z
+P(G ≤ r) ≥ P(MAX > µˆ (∗)+ ≥ y (i))
+t r t (cid:112) t
+N (γ,i)
+t
+z
+= E[E[1{MAX r > µˆ t (∗)+ (cid:112) ≥ y t (i)}|F t−1 ]] (18)
+N (γ,i)
+t
+z z
+= E[1{µˆ (∗)+ ≥ y (i)}P(MAX > µˆ (∗)+ |F )]
+t (cid:112) t r t (cid:112) t−1
+N (γ,i) N (γ,i)
+t t
+Using Fact 1,
+z 1 z
+P(MAX > µˆ (∗)+ |F ) ≥ 1−(1− √ e−z2/2)r
+r t (cid:112) N (γ,i) t−1 2πz2+1
+t
+√ √
+1 logr+1 e−1/2− logr
+= 1−(1− √ √ √ )r (19)
+2π( logr+1)2+1 r
+−√
+√ re−
+√
+√ logr
+≥ 1−e 2πe( logr+2)
+25
+For any r ≥ e25, e −√ 2 √ π r e e ( − √ √ lo l g og r+ r 2) ≤ 1 . Hence, for any r ≥ e25,
+r2
+z 1
+P(MAX > µˆ (∗)+ |F ) ≥ 1− .
+r t (cid:112) N (γ,i) t−1 r2
+t
+Therefore, for any r ≥ e25,
+1 z
+P(G ≤ r) ≥ (1− )P(µˆ (∗)+ ≥ y (i))
+t r2 t (cid:112) N (γ,i) t
+t
+Next, we apply self-normalized Hoeffding-type inequality(Garivier & Moulines, 2011) to
+lower bound P(µˆ (∗)+ √ z ≥ y (i)).
+t t
+Nt(γ,i)
+z z
+P(µˆ (∗)+ ≥ y (i)) ≥ 1−P(µˆ (∗)+ ≤ µ (∗))
+t (cid:112) t t (cid:112) t
+N (γ,i) N (γ,i)
+t t
+z
+≥ 1−P(µˆ (∗)−µ¨ (∗) ≤ U (γ,i)− )
+t t t (cid:112)
+N (γ,i)
+t
+√
+(a) logr
+≥ 1−P(µˆ (∗)−µ¨ (∗) < − )
+t t (cid:112)
+N (γ,i)
+t
+≥ 1− log 1− 1 γ e−2logr(1−η 1 2 6 )
+log(1+η)
+(cid:113) √
+(1−γ)log 1 −1− logr √
+where(a)followsfromthefactthatU (γ,i)−√ z = √ 1−γ < −√ logr .
+t
+Nt(γ,i) Nt(γ,i) Nt(γ,i)
+Let η = 2, we get
+z 1 1
+P(µˆ (∗)+ ≥ y (i)) ≥ 1−log .
+t (cid:112) N (γ,i) t 1−γr1.5
+t
+Substituting, for any r > e25,
+1 1 1
+P(G ≤ r) ≥ 1−log − (20)
+t 1−γr1.5 r2
+Therefore,
+∞
+(cid:88)
+E[G ] = P(G ≤ r)
+t t
+r=0
+(cid:88) 1 1 1
+≤ 1+e25+ (log + )
+1−γr1.5 r2
+r>e25
+1
+≤ e25+3+3log
+1−γ
+This proves a bound of E[ 1 ] ≤ e25+3+3log 1 independent of t.
+pi,t
+√
+1−γ
+144(1+ 2)2log( 1 +e25)
+Step 2. Define L(γ) = 1−γ . We consider the upper bound of E[ 1 ]
+∆2
+T
+pi,t
+when N (γ,i) > L(γ).
+t
+26
+z ∆ (i)
+P(G ≤ r) ≥ P(MAX > µˆ (∗)+ − t ≥ y (i))
+t r t (cid:112) t
+N (γ,i) 6
+t
+z ∆ (i) z ∆ (i)
+= E[1{µˆ (∗)+ − t ≥ y (i)}P(MAX > µˆ (∗)+ − t |F )]
+t (cid:112) t r t (cid:112) t−1
+N (γ,i) 6 N (γ,i) 6
+t t
+(21)
+Now, since N t (γ,i) > L(γ),√ N 1 t(γ,i) < 12(1+ √ 2) (cid:113) ∆ l t o ( g i) ( 1 +e25) . Therefore, for any r ≤ ( 1− 1 γ +
+1−γ
+e25)2,
+√
+z ∆ (i) logr+1 ∆ (i) ∆ (i)
+t t t
+− = − ≤ − .
+(cid:112) (cid:112)
+N (γ,i) 6 N (γ,i) 6 12
+t t
+Using Fact 1,
+P(θ t (i) > µˆ t (i)− ∆ 1 t 2 (i) |F t−1 ) ≤ 1− 2 1 e−Nt(γ,i)∆ 2 t 8 (i 8 )2 ≥ 1− 2(1/(1− 1 γ)+e25)2 .
+This implies
+z ∆ (i) 1
+P(MAX > µˆ (∗)+ − t |F ) ≥ 1− .
+r t (cid:112) N (γ,i) 6 t−1 2r(1/(1−γ)+e25)2r
+t
+Also, apply the fact that √ 1 < ∆t(i) and the self-normalized Hoeffding-type inequality,
+Nt(γ,i) 24
+z ∆ (i) ∆ (i)
+P(µˆ (∗)+ − t ≥ y (i)) ≥ P(µˆ (∗) ≥ µ (∗)− t ))
+t (cid:112) t t t
+N (γ,i) 6 6
+t
+1 1
+≥ 1−log .
+1−γ(1/(1−γ)+e25)6
+Let γ(cid:48) = ( 1 +e25)2. Therefore,for any 1 ≤ r ≤ γ(cid:48),
+1−γ
+1 1 1
+P(G ≤ r) ≥ 1− −log .
+t 2rγ(cid:48)2r 1−γγ(cid:48)6
+When r ≥ γ(cid:48) > e25, we can use Equation (20) to obtain,
+1 1 1
+P(G ≤ r) ≥ 1−log −
+t 1−γr1.5 r2
+27
+Combining these results,
+∞
+(cid:88)
+E[G ] ≤ P(G ≥ r)
+t t
+r=0
+γ(cid:48) ∞
+(cid:88) (cid:88)
+≤ 1+ P(G ≥ r)+ P(G ≥ r)
+t t
+r=1 r=γ(cid:48)
+γ(cid:48) ∞
+(cid:88) 1 1 1 (cid:88) 1 1 1
+≤ 1+ ( +log )+ (log + )
+2rγ(cid:48)2r 1−γγ(cid:48)6 1−γr1.5 r2
+r=1 r=γ(cid:48)
+1 1 1 2 1 3
+≤ 1+ +log + +log( )√
+γ(cid:48)2 1−γγ(cid:48)5 γ(cid:48) 1−γ γ(cid:48)
+1
+≤ 1+6(1−γ)log .
+1−γ
+Therefore, when N (γ,i) > L(γ), it holds that
+t
+1 1
+E[ ]−1 = E[G ]−1 ≤ 6(1−γ)log .
+t
+p 1−γ
+i,t
+Step 3 Let A(γ,i) = {t ∈ {1,...,T} : i = i∗,N (γ,i) ≤ L(γ)} and C = e25+ 1 +
+t t t F(µmax)
+τmax
+12. Combined with the case where N (γ,i) < 1 ,
+t τ2
+max
+(cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}]
+t t t t
+p
+i,t
+t∈T(γ)
+≤ (cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}]+ (cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}]
+t t t t t t t t
+p p
+i,t i,t
+t∈T(γ)∩A(γ,i) t∈T(γ)\A(γ,i)
+≤ |T(γ)∩A(γ,i)|(e25+3+3log 1 )+ 1 T(1−γ)A(γ)γ−1/(1−γ)+ (cid:88) E[ 1−p i,t ]
+1−γ F( µmax) p
+τmax t∈T(γ)\A(γ,i) i,t
+1 1 1
+≤ T(1−γ)L(γ)γ−1/(1−γ)(e25+ +3+3log )+6T(1−γ)log
+F( µmax) 1−γ 1−γ
+τmax
+1
+≤ CT(1−γ)L(γ)γ−1/(1−γ)log .
+1−γ
+(22)
+28
+B.3 Proofs of Lemma 3
+Let M (γ,i) = (cid:80)t γt−jµ (i)1{i = i}, µ¨ (γ,i) = Mt(γ,i) ∈ [0,1] is a convex combination
+t j=1 j j t Nt(γ,i)
+of elements µ (i),j = 1,...,t.
+j
+|µ (i)−µ¨ (γ,i)|
+t t
+t
+1 (cid:88)
+= | γt−j(µ (i)−µ (i))1{i = i}|
+j t j
+N (γ,i)
+t
+j=1
+t−D(γ) t
+1 (cid:88) 1 (cid:88)
+= | γt−j(µ (i)−µ (i))1{i = i}|+ | γt−j(µ (i)−µ (i))1{i = i}
+j t j j t j
+N (γ,i) N (γ,i)
+t t
+j=1 j=t−D(γ)
+ThefirstpartcanbeboundedbyU (γ,i). RecallthattheAssumption1: Thereexitsσ > 0,
+t
+for all t,t (cid:48) ≥ 1,1 ≤ i ≤ K, it holds that |µ
+t
+(i)−µ t(cid:48)(i)| ≤ σ|t−t (cid:48)|. Therefore,
+t t
+1 (cid:88) σD(γ) (cid:88)
+| γt−j(µ (i)−µ (i))1{i = i} ≤ | γt−j1{i = i} ≤ σD(γ).
+j t j j
+N (γ,i) N (γ,i)
+t t
+j=t−D(γ) j=t−D(γ)
+Hence, we get |µ (i)−µ¨ (γ,i)| ≤ U (γ,i)+σD(γ).
+t t t
+B.4 Proofs of Lemma 4
+The proof of Lemma 4 is almost the same as Lemma 2. Most of the results can be obtained
+directlyfromtheproofofLemma2,andwewillonlypresentthedifferentparts. Insmoothly
+n2log( 1 )
+changing settings, A(γ) = 1−γ . We first bound P(G ≤ r).
+(∆/3−2σD(γ))2 t
+z
+P(G ≤ r) ≥ P(MAX > µˆ (∗)+ ≥ y (i)−σD(γ))
+t r t (cid:112) t
+N (γ,i)
+t
+z z
+= E[1{µˆ (∗)+ ≥ y (i)−σD(γ)}P(MAX > µˆ (∗)+ |F )]
+t (cid:112) t r t (cid:112) t−1
+N (γ,i) N (γ,i)
+t t
+(23)
+For any r ≥ e25,
+1 z
+P(G ≤ r) ≥ (1− )P(µˆ (∗)+ ≥ y (i)−σD(γ))
+t r2 t (cid:112) N (γ,i) t
+t
+Weuseself-normalizedHoeffding-typeinequalitytolowerboundP(µˆ (∗)+√ z ≥ y (i)−
+t t
+Nt(γ,i)
+σD(γ)).
+z z
+P(µˆ (∗)+ ≥ y (i)−σD(γ)) ≥ 1−P(µˆ (∗)+ ≤ µ (∗)−σD(γ))
+t (cid:112) t t (cid:112) t
+N (γ,i) N (γ,i)
+t t
+(a) z
+≥ 1−P(µˆ (∗)−µ¨ (∗) ≤ U (γ,i)− )
+t t t (cid:112)
+N (γ,i)
+t
+√
+logr
+≥ 1−P(µˆ (∗)−µ¨ (∗) < − )
+t t (cid:112)
+N (γ,i)
+t
+≥ 1− log 1− 1 γ e−2logr(1−η 1 2 6 )
+log(1+η)
+29
+where (a) follows from the fact that µ (∗)−µ¨ (∗) ≤ U (γ,i)+σD(γ). Let η = 2, we get
+t t t
+z 1 1
+P(µˆ (∗)+ ≥ y (i)−σD(γ)) ≥ 1−log .
+t (cid:112) N (γ,i) t 1−γr1.5
+t
+Therefore,
+∞
+(cid:88) 1
+E[G ] = P(G ≤ r) ≤ e25+3+3log
+t t
+1−γ
+r=0
+√
+144(1+ 2)2log( 1 +e25)
+Next,let L(γ) = 1−γ . We derive a tighter bound for N (γ,i) > L(γ).
+∆2 t
+P(G ≤ r)
+t
+z ∆ (i)
+≥ P(MAX > µˆ (∗)+ − t ≥ y (i)−σD(γ))
+r t (cid:112) t
+N (γ,i) 6
+t
+z ∆ (i) z ∆ (i)
+= E[1{µˆ (∗)+ − t ≥ y (i)−σD(γ)}P(MAX > µˆ (∗)+ − t |F )]
+t (cid:112) t r t (cid:112) t−1
+N (γ,i) 6 N (γ,i) 6
+t t
+(24)
+Since N t (γ,i) > L(γ),√ N 1 t(γ,i) < 12(1+ √ 2) (cid:113) ∆ log( 1 +e25) . Therefore, for any r ≤ ( 1− 1 γ +
+1−γ
+e25)2,
+z ∆ (i) ∆ (i)
+t t
+− ≤ − .
+(cid:112)
+N (γ,i) 6 12
+t
+Using Fact 1,
+P(θ t (i) > µˆ t (i)− ∆ 1 t 2 (i) |F t−1 ) ≤ 1− 2 1 e−Nt(γ,i)∆ 2 t 8 (i 8 )2 ≥ 1− 2(1/(1− 1 γ)+e25)2 .
+This implies
+z ∆ (i) 1
+P(MAX > µˆ (∗)+ − t |F ) ≥ 1− .
+r t (cid:112) N (γ,i) 6 t−1 2r(1/(1−γ)+e25)2r
+t
+Also,applythefactthat √ 1 < ∆ andtheself-normalizedHoeffding-typeinequality,
+Nt(γ,i) 24
+z ∆ (i)
+P(µˆ (∗)+ − t ≥ y (i)−σD(γ))
+t (cid:112) t
+N (γ,i) 6
+t
+∆ (i)
+≥ P(µˆ (∗) ≥ µ (∗)−σD(γ)− t )
+t t
+6
+∆ (i)
+= 1−P(µˆ (∗)−µ¨ (∗) ≤ µ (∗)−µ¨ (∗)−σD(γ)− t )
+t t t t
+6
+∆ (i)
+≥ 1−P(µˆ (∗)−µ¨ (∗) ≤ − t )
+t t
+8
+1 1
+≥ 1−log .
+1−γ(1/(1−γ)+e25)6
+30
+Let γ(cid:48) = ( 1 +e25)2. Combining these results,
+1−γ
+∞
+(cid:88)
+E[G ] ≤ P(G ≥ r)
+t t
+r=0
+γ(cid:48) ∞
+(cid:88) (cid:88)
+≤ 1+ P(G ≥ r)+ P(G ≥ r)
+t t
+r=1 r=γ(cid:48)
+1
+≤ 1+6(1−γ)log .
+1−γ
+Therefore, when N (γ,i) > L(γ), it holds that
+t
+1 1
+E[ ]−1 = E[G ]−1 ≤ 6(1−γ)log .
+t
+p 1−γ
+i,t
+FollowsfromEquation(22)(step3intheproofofLemma2),letC = e25+ 1 +12,we
+F(µmax)
+τmax
+can get
+T
+(cid:88) E[ 1−p i,t1{i = i∗,θ (i) < y (i)}] ≤ CT(1−γ)L(γ)γ−1/(1−γ)log 1 .
+p t t t t 1−γ
+i,t
+t=1
+31

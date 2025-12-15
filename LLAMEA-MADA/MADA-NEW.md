@@ -2,15 +2,18 @@
 
 This document captures the new functionality and wiring introduced in the current MADA-LLAMEA framework. It focuses on what changed relative to the earlier LLaMEA / EoH variants and how the behavioral-diversity pipeline is implemented end-to-end in `main-thesis-mada.py`, `mada_components.py`, and `managers.py`.
 
-### What’s New (high level)
+### What's New (high level)
+
 - Behavioral traces are first-class: every algorithm run is wrapped by `TraceCollector`, producing best-so-far trajectories for diversity scoring.
 - Diversity-aware reward: composite reward `Δfitness + α·NN-Dist`, with α scheduled over generations and rewards standardized online.
+- **Parent selection is fitness-based only**: crossover selects parents by fitness ranking (no behavioral/trace-based parent selection). Experiments showed behavioral parent selection underperformed fitness-based selection.
 - Discounted Thompson Sampling (D-TS) controls operator choice (mutation vs crossover) using normalized composite rewards; tracks fitness vs diversity contributions separately.
 - Bandit and lineage logging: `bandit_snapshots.jsonl` and `mada_offspring.jsonl` record arm posteriors, rewards, and operator lineage per offspring.
 - Guardrailed LLM prompting: block/holistic prompts inject recent issues, strict attribute whitelists, and recombination helpers; supports innovation, recombination, and legacy refinement modes.
 - Robust evaluation harness: automatic helper injection, budget guarding, safe `np.random.choice`, and BBOB trace aggregation per algorithm.
 
 ### Core Components (new/updated)
+
 - `TraceCollector` (in `mada_components.py`)
   - Wraps the IOH problem, records best-so-far per eval, enforces budget, exposes `get_trace()` padded to budget.
   - `aggregate_traces()` provides a median-robust pooled trace for logging.
@@ -31,6 +34,7 @@ This document captures the new functionality and wiring introduced in the curren
   - Semantic linter prompt cleans merged helpers when needed.
 
 ### Evolutionary Loop Changes (`run_mada_evolutionary_mode`)
+
 - Initialization
   - Generates μ parents via `AlgorithmManager.fetch_algorithm`, deduplicated by SHA-256; evaluates each with trace capture and stores traces in `history_traces`.
   - Tracks global min/max fitness from traces for later NN-Dist normalization.
@@ -49,12 +53,16 @@ This document captures the new functionality and wiring introduced in the curren
 - Final summary prints bandit pulls, μ̂, and cumulative fitness/diversity rewards.
 
 ### Operator Strategies (current MADA loop)
+
 - Mutation path: LLM mutation prompt with performance breakdown and last error hints; child inherits parent lineage and increments generation.
-- Crossover path: implicit crossover prompt combining two best parents’ code and scores.
+- Crossover path: implicit crossover prompt combining two best parents' code and scores. **Parent selection is fitness-based** (top two by fitness), not trace/behavioral-based.
 - If only one parent exists, MADA falls back to mutation.
 - Elitism toggle controls whether parents survive into the next generation.
 
+> **Note on Behavioral Selection**: The `--behavioral-selection` flag exists in the CLI but is **disabled by default**. Experiments showed that trace-based parent selection (picking Parent B by maximum trace distance from Parent A) consistently underperformed simple fitness-based selection. The diversity signal is still captured via the NN-Dist reward component, but parent selection uses fitness ranking only.
+
 ### Logging & Artifacts
+
 - `exp-*/` directory per run with:
   - `ioh/` (IOH experimenter logs), `code/` (all tried algorithms), `conversationlog.txt`.
   - `try-*-aucs.txt` (AUC arrays, optional stats header).
@@ -63,13 +71,16 @@ This document captures the new functionality and wiring introduced in the curren
   - `BEST_ALGORITHM.py` (best code, fitness, generation, operator).
 
 ### CLI Surface (new/updated flags in `main-thesis-mada.py`)
-- Bandit: `--discount γ`, `--tau-max`, `--reward-variance`, `--reward-clamp`.
+
+- Bandit: `--discount γ` (default 0.9), `--tau-max` (default 1.0), `--reward-variance`, `--reward-clamp`.
 - MADA diversity: `--alpha-start`, `--alpha-end`, `--alpha-schedule` (linear|exponential|cosine|constant).
+- Parent selection: `--no-behavioral-selection` (default, recommended) or `--behavioral-selection` (experimental, not recommended).
 - Evolution: `--n-parents`, `--n-offspring`, `--generations`, `--elitism`, `--budget` (API calls), `--eval-budget` (per-algo evaluations).
 - API/model: `--model`, `--api-key`, `--base-url`, `--max-tokens`, `--experiment-name`.
 - Mode: `--evolutionary-mode` required to run the full MADA loop.
 
 ### Failure Handling & Guardrails
+
 - Missing code block / class name retries during parent seeding; deduped by code hash.
 - Safe `np.random.choice` wrapper avoids errors on small arrays; auto-injects common attributes if absent in candidate algorithms.
 - Errors during evaluation set fitness to 0.0, clear traces, penalize reward; D-TS still updated via composite reward.
@@ -77,18 +88,22 @@ This document captures the new functionality and wiring introduced in the curren
 - Prompts carry “recent issues” guardrail note to steer LLM away from repeated violations (missing helpers, placeholders, invalid blocks).
 
 ### How to Run (examples)
+
+- **Recommended configuration** (based on experiments):
+  - `python main-thesis-mada.py --evolutionary-mode --elitism --budget 50 --eval-budget 10000 --n-parents 4 --n-offspring 8 --alpha-start 0.7 --alpha-end 0.1 --alpha-schedule linear --tau-max 1.0 --discount 0.9`
 - Balanced exploratory run:
-  - `python main-thesis-mada.py --evolutionary-mode --elitism --budget 80 --eval-budget 10000 --n-parents 4 --n-offspring 12 --alpha-start 0.6 --alpha-end 0.0 --alpha-schedule cosine --discount 0.95`
+  - `python main-thesis-mada.py --evolutionary-mode --elitism --budget 80 --eval-budget 10000 --n-parents 4 --n-offspring 12 --alpha-start 0.6 --alpha-end 0.0 --alpha-schedule cosine --discount 0.9`
 - Faster smoke test:
   - `python main-thesis-mada.py --evolutionary-mode --budget 20 --eval-budget 2000 --n-parents 2 --n-offspring 6 --alpha-start 0.5 --alpha-end 0.1 --alpha-schedule linear`
 
 ### Implementation Hotspots (for reference)
+
 - `mada_components.py`: trace, diversity, reward, alpha scheduling helpers.
 - `main-thesis-mada.py`: D-TS bandit with reward decomposition; evaluation harness with trace capture; evolutionary loop with diversity-aware reward flow; logging.
 - `managers.py`: ExperimentLogger, AlgorithmManager prompts/guardrails, block/holistic prompt builders, semantic linter hook.
 
 ### Intended Outcomes
+
 - Encourage exploration early (high α, higher innovation acceptance) while converging later (α→0).
 - Stabilize bandit learning via standardized rewards and diversity decomposition.
 - Provide reproducible, inspectable runs with full lineage, traces, and bandit dynamics to analyze why an offspring emerged and how operators were credited.
-

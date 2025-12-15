@@ -1,0 +1,28 @@
+# STN Analyzer Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+networkx>=3.0                  # Graph construction and analysis
+numpy>=1.24                    # Numerical operations
+pandas>=2.0                    # Data manipulation (optional, for advanced analysis)
+tqdm>=4.65                     # Progress bars for long operations
+
+# Visualization - Static
+matplotlib>=3.7                # Static plot generation
+seaborn>=0.12                  # Enhanced statistical visualizations
+
+# Visualization - Interactive  
+pyvis>=0.3                     # Interactive HTML network visualizations
+
+# Optional dependencies for advanced features
+# scikit-learn>=1.3            # For dimensionality reduction (t-SNE, UMAP)
+# plotly>=5.15                 # Alternative interactive visualizations
+# pyyaml>=6.0                  # Configuration file support
+
+
+
+
+
+
+
+

@@ -6,12 +6,7 @@ from openai import OpenAI
 from datetime import datetime
 from llamea.utils import NoCodeException
 
-PROMPT_GUARDRAILS = [
-    "- You MAY add small helper utilities and restart logic inside the class; keep them class-scoped (no module-level globals).",
-    "- If the block depends on helpers such as update_archive(), call them instead of duplicating logic.",
-    "- Do not introduce orphaned dependencies; use helpers already present in the Context Block.",
-    "- Preserve class structure: only modify the requested block, not __init__ or __call__ wiring.",
-]
+PROMPT_GUARDRAILS = []  # Guardrails disabled for MADA v2
 
 # Block-level innovation prompt template (MADA 4.0 Section 5.6)
 BLOCK_INNOVATION_PROMPT = """You are improving a single method block of an optimizer class.
@@ -249,7 +244,7 @@ class ExperimentLogger:
             f.write(json.dumps(record, default=str) + "\n")
 
 class AlgorithmManager:
-    def __init__(self, api_key, logger, ai_model="gemini-2.0-flash", elitism=False, detailed_feedback=False, base_url=None, max_tokens=None):
+    def __init__(self, api_key, logger, ai_model="gemini-2.0-flash", elitism=False, detailed_feedback=False, base_url=None, max_tokens=None, allow_block_tools=False):
         """
         Initializes an instance of AlgorithmManager, which calls the GPT API and specifies the prompts.
         
@@ -269,6 +264,7 @@ class AlgorithmManager:
         self.ai_model = ai_model
         self.max_tokens = max_tokens
         self.elitism = elitism
+        self.allow_block_tools = allow_block_tools  # Disable block gen / semantic linter by default to mirror baseline behavior
         self.current_best_algorithm = ""
         self.current_best_AOCC = 0
         self.detailed_feedback = detailed_feedback
@@ -279,38 +275,41 @@ class AlgorithmManager:
         self.role_prompt = (
             "You are a highly skilled computer scientist in the field of natural computing. "
             "Your task is to design novel metaheuristic algorithms to solve black box optimization problems. "
-            "Do not use hyped nature-inspired algorithms such as Harmony Search, Grey Wolf, Firefly, Whale optimizer etc. since these are generally not well performing. "
-            "You may introduce concise helper utilities, restart logic, and archive/step-size management inside the class, provided the public __init__ and __call__ stay intact and total budget is respected."
+            "Do not use hyped nature-inspired algorithms such as Harmony Search, Grey Wolf, Firefly, Whale optimizer etc. since these are generally not well performing."
         )
         self.dynamic_guardrail_note = ""
         self._base_init_prompt = """
-The optimization algorithm should handle a wide range of tasks, which is evaluated on the BBOB test suite of 24 noiseless functions. Your task is to write the optimization algorithm in Python code. The code should contain an `__init__(self, budget)` function and the function `def __call__(self, func)`, which should optimize the black box function `func` using `self.budget` function evaluations.
+The optimization algorithm should handle a wide range of tasks, which is evaluated on the BBOB test suite of 24 noiseless functions. Your task is to write the optimization algorithm in Python code to minimize the function value. The code should contain an `__init__(self, budget)` function and the function `def __call__(self, func)`, which should optimize the black box function `func` using `self.budget` function evaluations.
 The func() can only be called as many times as the budget allows, not more. Each of the optimization functions has a search space between -5.0 (lower bound) and 5.0 (upper bound). The dimensionality is set to 5.
+Give an excellent and novel heuristic algorithm to solve this task.
+
 An example of such code (a simple random search), is as follows:
-```
+```python
+import numpy as np
+
 class RandomSearch:
     def __init__(self, budget=10000):
         self.budget = budget
         self.dim = None
+        self.f_opt = np.inf
+        self.x_opt = None
 
     def __call__(self, func):
         if self.dim is None:
             self.dim = len(func.bounds.lb)
-        self.f_opt = np.Inf
-        self.x_opt = None
         for i in range(self.budget):
             x = np.random.uniform(func.bounds.lb, func.bounds.ub)
-            
             f = func(x)
             if f < self.f_opt:
                 self.f_opt = f
                 self.x_opt = x
-            
         return self.f_opt, self.x_opt
 ```
-Give an excellent and novel heuristic algorithm to solve this task and also give it a name. Give the response in the format:
-# Name: <classname>
-# Code: <code>
+
+Provide the Python code and a one-line description with the main idea (without enters). Give the response in the format:
+# Description: <short-description>
+# Code:
+<code>
 """
         self.debug_mode = False
 
@@ -318,12 +317,7 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
         self.dynamic_guardrail_note = (note or "").strip()
 
     def _guardrail_lines(self):
-        lines = list(PROMPT_GUARDRAILS)
-        # Encourage diversification away from DE-style moves for new seeds.
-        lines.append("- Prefer alternative search moves over classic DE-style mutation/crossover when possible.")
-        if self.dynamic_guardrail_note:
-            lines.append(f"- Recent issues observed: {self.dynamic_guardrail_note}")
-        return lines
+        return []  # No guardrails
 
     def _render_guardrail_block(self):
         lines = self._guardrail_lines()
@@ -383,36 +377,16 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
             self.current_best_AOCC = auc_mean
             self.current_best_algorithm = self.extract_algorithm_code(self.last_algorithm)
         
-        guardrail_block = self._render_guardrail_block()
-        guardrail_suffix = f"\n{guardrail_block}" if guardrail_block else ""
         if self.last_error:
             refine_prompt = (
-                f"The last proposed algorithm {algorithm_name} got an error: {self.last_error}, "
-                f"an average Area over the convergence curve (AOCC, 1.0 is the best) of {auc_mean:.02f}, and a standard deviation of {auc_std:.02f}. "
-                f"Either refine or redesign to improve the algorithm. Give the response in the format:\n"
-                f"# Name: <classname>\n"
-                f"# Code: <code>"
-                f"{guardrail_suffix}"
+                f"Previous algorithm {algorithm_name} errored: {self.last_error}. AOCC {auc_mean:.2f}. "
+                f"Improve it. Reply only with:\n# Name: <classname>\n# Code: <code>"
             )
         else:
             refine_prompt = (
-                f"The last proposed algorithm {algorithm_name} got an average Area over the convergence curve (AOCC, 1.0 is the best) of {auc_mean:.02f}, "
-                f"and a standard deviation of {auc_std:.02f}. Either refine or redesign to improve the algorithm. Give the response in the format:\n"
-                f"# Name: <classname>\n"
-                f"# Code: <code>"
-                f"{guardrail_suffix}"
+                f"Previous algorithm {algorithm_name} scored AOCC {auc_mean:.2f}. "
+                f"Improve it. Reply only with:\n# Name: <classname>\n# Code: <code>"
             )
-            
-        if self.detailed_feedback:
-            detailed_feedback_prompt = (f"The mean AOCC score of the last algorithm on Separable functions was {detailed_aucs[0]:.02f}, "
-                                        f"on functions with low or moderate conditioning {detailed_aucs[1]:.02f}, "
-                                        f"on functions with high conditioning and unimodal {detailed_aucs[2]:.02f}, "
-                                        f"on Multi-modal functions with adequate global structure {detailed_aucs[3]:.02f}, "
-                                        f"and on Multi-modal functions with weak global structure {detailed_aucs[4]:.02f}")
-            
-        if self.elitism:
-            elitism_prompt = (f"The best so far proposed algorithm got an average AOCC of {self.current_best_AOCC:.02f} and the code was as follows:\n"
-                            f"{self.current_best_algorithm}")
 
         init_prompt = self._build_init_prompt()
         session_messages = [
@@ -421,10 +395,6 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
             {"role": "user", "content": self.tried_algorithms},
             {"role": "assistant", "content": self.last_algorithm},
         ]
-        if self.detailed_feedback:
-            session_messages.append({"role": "user", "content": detailed_feedback_prompt})
-        if self.elitism:
-            session_messages.append({"role": "user", "content": elitism_prompt})
         session_messages.append({"role": "user", "content": refine_prompt})
         #add tried algorithm for next time.
         for msg in session_messages:
@@ -437,7 +407,6 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
         if self.max_tokens:
             call_kwargs["max_tokens"] = self.max_tokens
         response = self.client.chat.completions.create(**call_kwargs)
-        self.tried_algorithms += f"\nYou already tried {algorithm_name}, with score: {auc_mean}"
         message = response.choices[0].message.content
         self.logger.log_conversation(message)
         return message
@@ -493,6 +462,10 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
         Raises:
             NoCodeException: If no code block is found in the response.
         """
+        if not self.allow_block_tools:
+            self.logger.log_conversation(f"\n[MADA Block Generation disabled] {block_name}\n")
+            return ""
+
         session_messages = [
             {"role": "system", "content": self.role_prompt},
             {"role": "user", "content": prompt}
@@ -526,6 +499,10 @@ Give an excellent and novel heuristic algorithm to solve this task and also give
         Returns:
             str: Cleaned-up code with conflicts resolved.
         """
+        if not self.allow_block_tools:
+            self.logger.log_conversation("\n[MADA Semantic Linter disabled]\n")
+            return timeout_fallback if timeout_fallback else code
+
         prompt = SEMANTIC_LINTER_PROMPT.format(code=code)
         
         session_messages = [

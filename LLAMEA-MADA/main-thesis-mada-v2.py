@@ -1,28 +1,23 @@
 """
-MADA-LLAMEA: Multi-Adaptive Diverse Algorithm with LLM Evolutionary Algorithm
+MADA-LLAMEA v2: Multi-Adaptive Diverse Algorithm with LLM Evolutionary Algorithm
 
-This extends main-thesis-eoh-dts.py with behavioral diversity rewards based on
-the MADA5.0 design document. Key enhancements:
+This extends main-thesis-mada.py with a third operator: REFINE.
 
-1. Trace Logging: Evaluation captures optimization trajectories (best-so-far)
-2. NN-Dist: Nearest-neighbor distance measures behavioral diversity
-3. Composite Reward: R = ΔFitness + α × NN-Dist
-4. Alpha Scheduler: Diversity weight decays from exploration to exploitation
-5. Reward Normalization: Running standardization for stable bandit learning
+Key Enhancements in v2:
+1. Three Operators: mutation, crossover, refine
+2. Refine Operator: Mutation-style but with detailed benchmark feedback
+   - Focuses on redesigning and refining the parent algorithm
+   - Includes per-function-group performance breakdown
+3. All three operators compete via Discounted Thompson Sampling
 
-Mathematical Foundation:
-- Composite Reward: R_t = (Fit_child - Fit_parent) + α × d(trace_new, trace_history)
-- Alpha Decay: α_t = α_start × (1 - t/T_max)
-- NN-Dist: d(x,y) = sqrt(sum((x[t] - y[t])²)) / sqrt(B)
-
-References:
-- MADA 5.0: Design Document
-- van Stein et al. (2025): Behaviour Space Analysis of LLM-driven Meta-heuristic Discovery
-- Qi, Guo, Zhu (2025): Discounted Thompson Sampling
+Operator Descriptions:
+- Mutation: Generate a NEW and DIFFERENT algorithm
+- Crossover: Combine patterns from two high-scoring solutions
+- Refine: Redesign and refine the strategy to improve specific weaknesses
 
 Usage:
-    python main-thesis-mada.py --evolutionary-mode --elitism --budget 50
-    python main-thesis-mada.py --evolutionary-mode --elitism --alpha-start 0.7 --alpha-schedule cosine --budget 100
+    python main-thesis-mada-v2.py --evolutionary-mode --elitism --budget 50
+    python main-thesis-mada-v2.py --evolutionary-mode --elitism --alpha-start 0.7 --alpha-schedule cosine --budget 100
 """
 
 import os
@@ -70,7 +65,7 @@ except ImportError:
 
 
 # ==============================================================================
-# DISCOUNTED THOMPSON SAMPLING (from main-thesis-eoh-dts.py)
+# DISCOUNTED THOMPSON SAMPLING (Extended for 3 arms)
 # ==============================================================================
 
 @dataclass
@@ -91,7 +86,7 @@ class ArmStatistics:
 class DiscountedThompsonSampler:
     """
     Discounted Thompson Sampling with Gaussian Posteriors.
-    Extended for MADA with reward component tracking.
+    Extended for MADA v2 with 3 operators and reward component tracking.
     """
     
     def __init__(
@@ -99,7 +94,7 @@ class DiscountedThompsonSampler:
         arms: List[str],
         discount: float = 0.9,
         tau_max: float = 1.0,
-        reward_variance: float = 0.25,
+        reward_variance: float = 1.0,  # Normalized rewards have variance ~1
         prior_mean: float = 0.0,
     ):
         self.arms = arms
@@ -112,10 +107,10 @@ class DiscountedThompsonSampler:
         for arm in arms:
             self.arm_stats[arm] = ArmStatistics(
                 name=arm,
-                N=1.0,
-                mu_tilde=prior_mean,
-                mu_hat=prior_mean,
-                tau=tau_max,
+                N=0.0,  # Paper uses N=0 for proper D-TS initialization
+                mu_tilde=0.0,  # Also 0 per paper
+                mu_hat=prior_mean,  # Prior mean when N=0
+                tau=tau_max,  # Maximum exploration initially
             )
         
         self.total_rounds = 0
@@ -148,10 +143,19 @@ class DiscountedThompsonSampler:
     
     def update(self, arm_name: str, reward: float) -> None:
         """Update the posterior for the selected arm."""
-        # Apply discount to ALL arms
+        # Precompute sigma for tau calculation
+        sigma = np.sqrt(self.reward_variance)
+        
+        # Apply discount to ALL arms and update their tau
         for stats in self.arm_stats.values():
             stats.N = self.discount * stats.N
             stats.mu_tilde = self.discount * stats.mu_tilde
+            # Update tau for all arms after discounting
+            # tau = sigma / sqrt(N) is the posterior std dev
+            if stats.N > 0:
+                stats.tau = min(sigma / np.sqrt(stats.N), self.tau_max)
+            else:
+                stats.tau = self.tau_max
         
         # Update selected arm
         if arm_name in self.arm_stats:
@@ -166,8 +170,9 @@ class DiscountedThompsonSampler:
             else:
                 stats.mu_hat = self.prior_mean
             
+            # Update tau for selected arm after adding new observation
             if stats.N > 0:
-                stats.tau = min(1.0 / np.sqrt(stats.N), self.tau_max)
+                stats.tau = min(sigma / np.sqrt(stats.N), self.tau_max)
             else:
                 stats.tau = self.tau_max
         
@@ -218,20 +223,20 @@ class DiscountedThompsonSampler:
 
 
 # ==============================================================================
-# EoH PROMPT TEMPLATES
+# BASELINE LLAMEA PROMPT TEMPLATES (v2 with 3 operators)
 # ==============================================================================
 
-EOH_SYSTEM_PROMPT = """You are a highly skilled computer scientist specializing in evolutionary algorithm design.
-Your task is to design novel metaheuristic algorithms to solve black box optimization problems.
-Do not use hyped nature-inspired algorithms such as Harmony Search, Grey Wolf, Firefly, Whale optimizer etc.
-Focus on well-established techniques like Differential Evolution, CMA-ES, Evolution Strategies, or novel hybrid approaches."""
+# Role/System Prompt
+ROLE_PROMPT = """You are a highly skilled computer scientist in the field of natural computing. Your task is to design novel metaheuristic algorithms to solve black box optimization problems."""
 
-EOH_INIT_PROMPT = """
-The optimization algorithm should handle a wide range of tasks, evaluated on the BBOB test suite of 24 noiseless functions. 
-Write the optimization algorithm in Python code with an `__init__(self, budget)` function and `def __call__(self, func)`.
-The func() can only be called as many times as the budget allows. Search space: [-5.0, 5.0], dimensionality: 5.
+# Task Prompt
+TASK_PROMPT = """The optimization algorithm should handle a wide range of tasks, which is evaluated on the BBOB test suite of 24 noiseless functions. Your task is to write the optimization algorithm in Python code to minimize the function value. The code should contain an `__init__(self, budget)` function and the function `def __call__(self, func)`, which should optimize the black box function `func` using `self.budget` function evaluations.
+The func() can only be called as many times as the budget allows, not more. Each of the optimization functions has a search space between -5.0 (lower bound) and 5.0 (upper bound). The dimensionality is set to 5.
+Give an excellent and novel heuristic algorithm to solve this task.
+"""
 
-Example (simple random search):
+# Example Prompt
+EXAMPLE_PROMPT = """An example of such code (a simple random search), is as follows:
 ```python
 import numpy as np
 
@@ -239,12 +244,12 @@ class RandomSearch:
     def __init__(self, budget=10000):
         self.budget = budget
         self.dim = None
+        self.f_opt = np.inf
+        self.x_opt = None
 
     def __call__(self, func):
         if self.dim is None:
             self.dim = len(func.bounds.lb)
-        self.f_opt = np.Inf
-        self.x_opt = None
         for i in range(self.budget):
             x = np.random.uniform(func.bounds.lb, func.bounds.ub)
             f = func(x)
@@ -253,57 +258,27 @@ class RandomSearch:
                 self.x_opt = x
         return self.f_opt, self.x_opt
 ```
-
-Give an excellent and novel heuristic algorithm. Format:
-# Name: <classname>
-# Code: <code>
 """
 
-EOH_CROSSOVER_IMPLICIT_PROMPT = """I am designing metaheuristic algorithms for black-box optimization (BBOB benchmark, 5D, bounds [-5, 5]).
-
-Here are two high-scoring solutions:
-
-Solution 1 (Score: {score_a:.4f}):
-```python
-{code_a}
-```
-{feedback_a}
-
-Solution 2 (Score: {score_b:.4f}):
-```python
-{code_b}
-```
-{feedback_b}
-{error_analysis}
-Generate a Solution 3 that achieves an even higher score by combining patterns from both.
-Follow the same interface: __init__(self, budget) and __call__(self, func)
-
-Format:
-# Name: <classname>
-# Code: <code>
+# Output Format Prompt
+OUTPUT_FORMAT_PROMPT = """Provide the Python code and a one-line description with the main idea (without enters). Give the response in the format:
+# Description: <short-description>
+# Code:
+<code>
 """
 
-EOH_MUTATION_PROMPT = """
-The optimization algorithm should handle BBOB test suite functions. Write Python code with `__init__(self, budget)` and `def __call__(self, func)`.
-Budget: 10000 evaluations. Search space: [-5.0, 5.0], dim: 5.
+# Mutation Instruction - Emphasize novelty and exploration
+MUTATION_INSTRUCTION = """Generate a COMPLETELY NEW metaheuristic algorithm that is fundamentally DIFFERENT from all existing algorithms in the population.
 
-Reference algorithm (score: {score:.4f}):
-```python
-{code}
-```
+Your goal is to BROADEN the search space by exploring novel algorithmic paradigms, mechanisms, and strategies that have NOT been tried yet.
 
-{feedback}
+Requirements:
+- Use a DIFFERENT optimization mechanism (e.g., if current algorithms use DE, try CMA-ES, Bayesian, surrogate-assisted, etc.)
+- Do NOT simply modify parameters or add minor variations
+- Create a genuinely novel approach with distinct characteristics"""
 
-Design a NEW and DIFFERENT algorithm for a higher score. Use techniques like:
-- Differential Evolution variants (DE/rand, SHADE, L-SHADE)
-- Evolution Strategies (CMA-ES, self-adaptive ES)
-- Particle Swarm Optimization variants
-- Hybrid approaches, novel adaptive mechanisms
-
-Format:
-# Name: <classname>
-# Code: <code>
-"""
+# Initialization Prompt (combines task + example + format)
+INIT_PROMPT = TASK_PROMPT + EXAMPLE_PROMPT + OUTPUT_FORMAT_PROMPT
 
 
 # ==============================================================================
@@ -324,24 +299,31 @@ class MADASolution:
         self.generation = generation
         self.parent_ids = parent_ids or []
         self.fitness = 0.0
+        self.fitness_std = 0.0  # Standard deviation of AUCs
         self.aucs = []
         self.detailed_aucs = [0, 0, 0, 0, 0]
         self.trace = []  # MADA: Optimization trace for diversity
         self.error = ""
         self.operator = ""
-
-
-# ==============================================================================
-# MADA OPERATOR
-# ==============================================================================
-
-class MADAOperator:
-    """
-    MADA Operator with Discounted Thompson Sampling and behavioral diversity.
+        self.feedback = ""  # Baseline LLAMEA style feedback
     
-    Supports behavioral parent selection for crossover based on trace diversity:
-    - Parent A: Best fitness (exploitation)
-    - Parent B: Maximum trace distance from A (exploration)
+    def get_summary(self):
+        """Returns formatted summary for population context (baseline LLAMEA style)."""
+        return f"{self.name}: {self.description} (Score: {self.fitness:.4f})"
+
+
+# ==============================================================================
+# MADA OPERATOR v2 (with 3 operators)
+# ==============================================================================
+
+class MADAOperatorV2:
+    """
+    MADA Operator v2 with Discounted Thompson Sampling and 3 operators.
+    
+    Operators:
+    - mutation: Generate a NEW and DIFFERENT algorithm
+    - crossover: Combine patterns from two solutions
+    - refine: Redesign and refine to address specific weaknesses
     """
     
     def __init__(
@@ -350,18 +332,43 @@ class MADAOperator:
         crossover_style: str = "implicit",
         discount: float = 0.9,
         tau_max: float = 1.0,
-        reward_variance: float = 0.25,
+        reward_variance: float = 1.0,  # Normalized rewards have variance ~1
         reward_clamp: float = 1.0,
         use_behavioral_selection: bool = True,
+        detailed_feedback: bool = False,
+        enable_mutation: bool = True,
+        enable_crossover: bool = True,
+        enable_refine: bool = True,
+        warmup_refine: int = 0,  # Number of generations to force refine
     ):
         self.algorithm_manager = algorithm_manager
         self.crossover_style = crossover_style
         self.child_counter = 0
         self.reward_clamp = reward_clamp
         self.use_behavioral_selection = use_behavioral_selection
+        self.detailed_feedback = detailed_feedback
+        self.enable_mutation = enable_mutation
+        self.enable_crossover = enable_crossover
+        self.enable_refine = enable_refine
+        self.warmup_refine = warmup_refine  # Force refine for first N generations
+        self.current_generation = 0  # Track current generation for warmup
+        self.population = []  # Track current population for baseline-style prompts
+        self.best_ever = None  # Track best algorithm for baseline-style prompts
         
+        # Build arm set based on enabled operators
+        arms = []
+        if self.enable_mutation:
+            arms.append('mutation')
+        if self.enable_crossover:
+            arms.append('crossover')
+        if self.enable_refine:
+            arms.append('refine')
+        if not arms:
+            raise ValueError("At least one operator must be enabled")
+        
+        # v2: bandit over enabled arms
         self.bandit = DiscountedThompsonSampler(
-            arms=['mutation', 'crossover'],
+            arms=arms,
             discount=discount,
             tau_max=tau_max,
             reward_variance=reward_variance,
@@ -369,17 +376,21 @@ class MADAOperator:
         
         self._mutation_count = 0
         self._crossover_count = 0
+        self._refine_count = 0
         self._last_selection_info = {}
+        self._last_algorithm = ""  # Track last algorithm response (baseline style)
     
     def reset_generation_counts(self):
         self._mutation_count = 0
         self._crossover_count = 0
+        self._refine_count = 0
     
     def get_operator_stats(self) -> Dict:
         return {
             'mutation_count': self._mutation_count,
             'crossover_count': self._crossover_count,
-            'total': self._mutation_count + self._crossover_count,
+            'refine_count': self._refine_count,
+            'total': self._mutation_count + self._crossover_count + self._refine_count,
         }
     
     def get_bandit_state(self) -> Dict:
@@ -400,24 +411,45 @@ class MADAOperator:
         if not parents:
             raise ValueError("MADAOperator requires at least one parent")
         
-        if len(parents) < 2:
-            operator = 'mutation'
-            theta = 0.0
-            snapshot = {}
-        else:
-            operator, theta, snapshot = self.bandit.select_arm()
+        operator, theta, snapshot = self.bandit.select_arm()
+        
+        # Warmup: Force refine for first N generations
+        warmup_forced = False
+        if self.warmup_refine > 0 and self.current_generation <= self.warmup_refine:
+            operator = 'refine'
+            warmup_forced = True
+        
+        # If crossover selected but unavailable (disabled or insufficient parents), fallback to refine
+        if operator == 'crossover' and (not self.enable_crossover or len(parents) < 2):
+            operator = 'refine'
+        # If mutation selected but disabled, fallback to refine
+        if operator == 'mutation' and not self.enable_mutation:
+            operator = 'refine'
+        # If refine disabled (edge case), fallback to mutation or crossover if enabled
+        if operator == 'refine' and not self.enable_refine:
+            if self.enable_mutation:
+                operator = 'mutation'
+            elif self.enable_crossover and len(parents) >= 2:
+                operator = 'crossover'
+            else:
+                raise ValueError("No enabled operator available for offspring generation")
         
         self._last_selection_info = {
             'operator': operator,
             'theta_sampled': theta,
             'snapshot': snapshot,
+            'warmup_forced': warmup_forced,
         }
         
         if operator == 'mutation':
             self._mutation_count += 1
             parent = focal_parent or random.choice(parents)
-            child = self._mutate(parent)
-        else:
+            child = self._mutate(parent, all_parents=parents)
+        elif operator == 'refine':
+            self._refine_count += 1
+            parent = focal_parent or random.choice(parents)
+            child = self._refine(parent)
+        else:  # crossover
             self._crossover_count += 1
             sorted_parents = sorted(parents, key=lambda p: p.fitness, reverse=True)
             parent_a = sorted_parents[0]
@@ -426,38 +458,59 @@ class MADAOperator:
         
         return child, self._last_selection_info
     
-    def _mutate(self, parent: MADASolution) -> MADASolution:
-        """Apply mutation."""
+    def _mutate(self, parent: MADASolution, all_parents: List[MADASolution] = None) -> MADASolution:
+        """Apply mutation - generate a completely NEW algorithm different from all existing ones."""
         self.child_counter += 1
         
+        # Set last_algorithm for conversation context
+        self._last_algorithm = f"# Name: {parent.name}\n# Description: {parent.description}\n# Code:\n```python\n{parent.code}\n```"
+        
+        # Build detailed feedback for parent's performance breakdown (if enabled)
         feedback_parts = []
-        if parent.detailed_aucs and any(parent.detailed_aucs):
-            feedback_parts.append("Performance breakdown:")
+        if self.detailed_feedback and parent.detailed_aucs and any(parent.detailed_aucs):
+            feedback_parts.append("Performance breakdown of the reference algorithm:")
             feedback_parts.append(f"  - Separable functions: {parent.detailed_aucs[0]:.4f}")
             feedback_parts.append(f"  - Low/moderate conditioning: {parent.detailed_aucs[1]:.4f}")
             feedback_parts.append(f"  - High conditioning & unimodal: {parent.detailed_aucs[2]:.4f}")
             feedback_parts.append(f"  - Multimodal (adequate structure): {parent.detailed_aucs[3]:.4f}")
             feedback_parts.append(f"  - Multimodal (weak structure): {parent.detailed_aucs[4]:.4f}")
         if parent.error:
-            feedback_parts.append(f"Previous error: {parent.error}")
+            feedback_parts.append(f"Previous error to avoid: {parent.error}")
         
-        feedback = "\n".join(feedback_parts) if feedback_parts else "No specific feedback."
+        detailed_feedback = "\n".join(feedback_parts) if feedback_parts else ""
         
-        prompt = EOH_MUTATION_PROMPT.format(
-            score=parent.fitness,
-            code=parent.code,
-            feedback=feedback
-        )
+        # Build list of existing algorithms to avoid duplicating
+        existing_algorithms = []
+        if all_parents:
+            for p in all_parents[:5]:  # Show top 5 algorithms
+                existing_algorithms.append(f"  - {p.name}: {p.description} (AOCC: {p.fitness:.2f})")
+        existing_summary = "\n".join(existing_algorithms) if existing_algorithms else "None yet."
+        
+        # Build mutation prompt with exploration emphasis
+        prompt = f"""{MUTATION_INSTRUCTION}
+
+**EXISTING ALGORITHMS (DO NOT duplicate these approaches):**
+{existing_summary}
+
+{detailed_feedback}
+
+Generate a completely NEW algorithm with a DIFFERENT mechanism. Give the response in the format:
+# Description: <short-description>
+# Code: <code>"""
         
         try:
             message = self._call_llm(prompt)
             code = self._extract_code(message)
+            description = self._extract_description(message)
             class_name = self._extract_class_name(code, f"{parent.name}Mut{self.child_counter}")
+            
+            # Update last_algorithm with new response
+            self._last_algorithm = message
             
             solution = MADASolution(
                 code=code,
                 name=class_name,
-                description=class_name,
+                description=description,
                 generation=parent.generation + 1,
                 parent_ids=[parent.id]
             )
@@ -476,13 +529,92 @@ class MADAOperator:
             solution.error = str(e)
             return solution
     
-    def _crossover(self, parent_a: MADASolution, parent_b: MADASolution) -> MADASolution:
-        """Apply crossover with error analysis feedback."""
+    def _refine(self, parent: MADASolution) -> MADASolution:
+        """Apply refine - with detailed feedback to guide improvements."""
         self.child_counter += 1
         
-        # Build feedback for Parent A (performance breakdown)
+        # Set last_algorithm for conversation context
+        self._last_algorithm = f"# Name: {parent.name}\n# Description: {parent.description}\n# Code:\n```python\n{parent.code}\n```"
+        
+        # Build detailed feedback for parent's performance breakdown (if enabled)
+        feedback_parts = []
+        if self.detailed_feedback and parent.detailed_aucs and any(parent.detailed_aucs):
+            feedback_parts.append("Performance breakdown:")
+            feedback_parts.append(f"  - Separable functions: {parent.detailed_aucs[0]:.4f}")
+            feedback_parts.append(f"  - Low/moderate conditioning: {parent.detailed_aucs[1]:.4f}")
+            feedback_parts.append(f"  - High conditioning & unimodal: {parent.detailed_aucs[2]:.4f}")
+            feedback_parts.append(f"  - Multimodal (adequate structure): {parent.detailed_aucs[3]:.4f}")
+            feedback_parts.append(f"  - Multimodal (weak structure): {parent.detailed_aucs[4]:.4f}")
+            
+            # Identify weakest area(s) for targeted improvement
+            min_auc = min(parent.detailed_aucs)
+            weakest_idx = parent.detailed_aucs.index(min_auc)
+            weakness_names = ["Separable functions", "Low/moderate conditioning", 
+                            "High conditioning & unimodal", "Multimodal (adequate structure)", 
+                            "Multimodal (weak structure)"]
+            feedback_parts.append(f"\n**FOCUS AREA**: The algorithm struggles most with {weakness_names[weakest_idx]} (AOCC: {min_auc:.4f}). Consider improving this aspect.")
+        
+        detailed_feedback = "\n".join(feedback_parts) if feedback_parts else ""
+        
+        # Build prompt with detailed feedback
+        if parent.error:
+            prompt = f"""The last proposed algorithm {parent.name} got an error: {parent.error}.
+
+{detailed_feedback}
+
+Either refine or redesign to fix the error and improve the algorithm. Give the response in the format:
+# Description: <short-description>
+# Code: <code>"""
+        else:
+            prompt = f"""The last proposed algorithm {parent.name} got an average Area over the convergence curve (AOCC, 1.0 is the best) of {parent.fitness:.2f}, and a standard deviation of {parent.fitness_std:.2f}.
+
+{detailed_feedback}
+
+Either refine or redesign to improve the algorithm, especially focusing on the weak areas identified above. Give the response in the format:
+# Description: <short-description>
+# Code: <code>"""
+        
+        try:
+            message = self._call_llm(prompt)
+            code = self._extract_code(message)
+            description = self._extract_description(message)
+            class_name = self._extract_class_name(code, f"{parent.name}Ref{self.child_counter}")
+            
+            # Update last_algorithm with new response
+            self._last_algorithm = message
+            
+            solution = MADASolution(
+                code=code,
+                name=class_name,
+                description=description,
+                generation=parent.generation + 1,
+                parent_ids=[parent.id]
+            )
+            solution.operator = "refine"
+            return solution
+            
+        except Exception as e:
+            solution = MADASolution(
+                code=parent.code,
+                name=f"{parent.name}RefFail{self.child_counter}",
+                description=f"Refine failed: {e}",
+                generation=parent.generation + 1,
+                parent_ids=[parent.id]
+            )
+            solution.operator = "refine_failed"
+            solution.error = str(e)
+            return solution
+    
+    def _crossover(self, parent_a: MADASolution, parent_b: MADASolution) -> MADASolution:
+        """Apply crossover with detailed feedback for both parents."""
+        self.child_counter += 1
+        
+        # Crossover doesn't use last_algorithm (fresh conversation)
+        self._last_algorithm = ""
+        
+        # Build detailed feedback for Parent A (if enabled)
         feedback_a_parts = []
-        if parent_a.detailed_aucs and any(parent_a.detailed_aucs):
+        if self.detailed_feedback and parent_a.detailed_aucs and any(parent_a.detailed_aucs):
             feedback_a_parts.append("Performance breakdown:")
             feedback_a_parts.append(f"  - Separable functions: {parent_a.detailed_aucs[0]:.4f}")
             feedback_a_parts.append(f"  - Low/moderate conditioning: {parent_a.detailed_aucs[1]:.4f}")
@@ -491,9 +623,9 @@ class MADAOperator:
             feedback_a_parts.append(f"  - Multimodal (weak structure): {parent_a.detailed_aucs[4]:.4f}")
         feedback_a = "\n".join(feedback_a_parts) if feedback_a_parts else ""
         
-        # Build feedback for Parent B (performance breakdown)
+        # Build detailed feedback for Parent B (if enabled)
         feedback_b_parts = []
-        if parent_b.detailed_aucs and any(parent_b.detailed_aucs):
+        if self.detailed_feedback and parent_b.detailed_aucs and any(parent_b.detailed_aucs):
             feedback_b_parts.append("Performance breakdown:")
             feedback_b_parts.append(f"  - Separable functions: {parent_b.detailed_aucs[0]:.4f}")
             feedback_b_parts.append(f"  - Low/moderate conditioning: {parent_b.detailed_aucs[1]:.4f}")
@@ -507,31 +639,45 @@ class MADAOperator:
         if parent_a.error or parent_b.error:
             error_parts.append("\n**ERROR ANALYSIS - Avoid these issues in the new solution:**")
             if parent_a.error:
-                error_parts.append(f"  - Solution 1 error: {parent_a.error}")
+                error_parts.append(f"  - Parent A error: {parent_a.error}")
             if parent_b.error:
-                error_parts.append(f"  - Solution 2 error: {parent_b.error}")
+                error_parts.append(f"  - Parent B error: {parent_b.error}")
             error_parts.append("  - Ensure proper bounds checking, avoid division by zero, handle edge cases.")
         error_analysis = "\n".join(error_parts) if error_parts else ""
         
-        prompt = EOH_CROSSOVER_IMPLICIT_PROMPT.format(
-            score_a=parent_a.fitness,
-            code_a=parent_a.code,
-            feedback_a=feedback_a,
-            score_b=parent_b.fitness,
-            code_b=parent_b.code,
-            feedback_b=feedback_b,
-            error_analysis=error_analysis
-        )
+        # Crossover prompt with detailed feedback
+        prompt = f"""Two parent solutions have been selected:
+
+**Parent A: {parent_a.name}** (AOCC: {parent_a.fitness:.2f})
+```python
+{parent_a.code}
+```
+{feedback_a}
+
+**Parent B: {parent_b.name}** (AOCC: {parent_b.fitness:.2f})
+```python
+{parent_b.code}
+```
+{feedback_b}
+{error_analysis}
+
+Create a better offspring by combining the STRENGTHS from both parent algorithms. Use the performance breakdown to identify which parent is better at which function types, and combine their best strategies.
+
+Give the response in the format:
+# Description: <short-description>
+# Code: <code>"""
         
         try:
-            message = self._call_llm(prompt)
+            # Crossover does NOT include best algorithm (include_best=False)
+            message = self._call_llm(prompt, include_best=False)
             code = self._extract_code(message)
+            description = self._extract_description(message)
             class_name = self._extract_class_name(code, f"Hybrid{self.child_counter}")
             
             solution = MADASolution(
                 code=code,
                 name=class_name,
-                description=class_name,
+                description=description,
                 generation=max(parent_a.generation, parent_b.generation) + 1,
                 parent_ids=[parent_a.id, parent_b.id]
             )
@@ -553,16 +699,6 @@ class MADAOperator:
     def _select_diverse_parent(self, sorted_parents, parent_a):
         """
         Select a diverse parent for crossover.
-        
-        When behavioral selection is enabled, uses trace-based Euclidean distance.
-        When disabled, falls back to code-difference heuristic.
-        
-        Args:
-            sorted_parents: Population sorted by fitness (descending)
-            parent_a: The best parent (already selected)
-            
-        Returns:
-            MADASolution: Most diverse parent from parent_a
         """
         if len(sorted_parents) < 2:
             return parent_a
@@ -592,13 +728,38 @@ class MADAOperator:
                 return candidate
         return sorted_parents[1]
     
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, include_best: bool = True) -> str:
+        """Call LLM with TRUE baseline LLAMEA conversation structure."""
+        # Build conversation history like baseline LLAMEA
         messages = [
-            {"role": "system", "content": EOH_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": ROLE_PROMPT},
+            {"role": "user", "content": INIT_PROMPT},
         ]
         
-        self.algorithm_manager.logger.log_conversation(f"\n[MADA Prompt]\n{prompt}\n")
+        # Add population context (current population summary)
+        if self.population:
+            pop_summary = "\n".join([
+                f"  - {ind.name}: {ind.description} (fitness={ind.fitness:.4f})"
+                for ind in self.population[:5]
+            ])
+            messages.append({"role": "user", "content": f"Current population:\n{pop_summary}"})
+        
+        # Add best algorithm so far (like baseline LLAMEA) - skip for crossover
+        if include_best and self.best_ever and self.best_ever.fitness > 0:
+            best_context = f"""The best so far proposed algorithm got an average AOCC of {self.best_ever.fitness:.2f} and the code was as follows:
+{self.best_ever.code}"""
+            messages.append({"role": "user", "content": best_context})
+        
+        # Add last algorithm as assistant response (for mutation/refine only)
+        if self._last_algorithm:
+            messages.append({"role": "assistant", "content": self._last_algorithm})
+        
+        # Add current prompt (mutation/refine/crossover request)
+        messages.append({"role": "user", "content": prompt})
+        
+        # Log the conversation
+        for msg in messages:
+            self.algorithm_manager.logger.log_conversation(f"\n[{msg['role']}]\n{msg['content']}")
         
         call_kwargs = {
             "model": self.algorithm_manager.ai_model,
@@ -611,11 +772,12 @@ class MADAOperator:
         response = self.algorithm_manager.client.chat.completions.create(**call_kwargs)
         message = response.choices[0].message.content
         
-        self.algorithm_manager.logger.log_conversation(f"\n[MADA Response]\n{message}\n")
+        self.algorithm_manager.logger.log_conversation(f"\n[assistant]\n{message}")
         
         return message
     
     def _extract_code(self, message: str) -> str:
+        """Extract code from LLM response."""
         pattern = r"```(?:python)?\n(.*?)\n```"
         match = re.search(pattern, message, re.DOTALL | re.IGNORECASE)
         if match:
@@ -623,12 +785,25 @@ class MADAOperator:
         raise NoCodeException("No code block found")
     
     def _extract_class_name(self, code: str, default: str) -> str:
+        """Extract class name from code."""
         for line in code.splitlines():
             if line.strip().startswith("class "):
                 match = re.search(r"class\s+(\w+)", line)
                 if match:
                     return match.group(1)
         return default
+    
+    def _extract_description(self, message: str) -> str:
+        """Extract description from LLM response (baseline LLAMEA style)."""
+        pattern = r"#\s*Description:\s*(.+?)(?:\n|$)"
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return "No description provided"
+    
+    def _construct_population_summary(self, parents: List[MADASolution]) -> str:
+        """Generate population summary for baseline LLAMEA style prompts."""
+        return "\n".join([ind.get_summary() for ind in parents])
 
 
 # ==============================================================================
@@ -718,6 +893,7 @@ def evaluate_algorithm_with_trace(algorithm_code, algorithm_name, eval_budget):
                     l2.reset(problem)
                     problem.reset()
             
+            # Safely aggregate per-group AUCs (avoid mean of empty slice)
             if fid == 5:
                 detailed_aucs[0] = np.mean(detail_aucs); detail_aucs = []
             elif fid == 9:
@@ -768,41 +944,30 @@ def log_bandit_snapshot(explogger, generation, bandit_state):
 # ==============================================================================
 
 def selection(population, n_parents, elitism=True):
-    """Select best individuals from population."""
-    sorted_pop = sorted(population, key=lambda x: x.fitness, reverse=True)
+    """
+    Select the best individuals from the population.
     
-    if not sorted_pop:
+    This matches the baseline LLaMEA selection function exactly:
+    - Always deterministic best-first selection
+    - The elitism logic (μ+λ vs μ,λ) is handled by the CALLING code,
+      which passes either parents+offspring or just offspring.
+    
+    Args:
+        population: List of individuals to select from
+        n_parents: Number of individuals to select
+        elitism: Parameter kept for API compatibility, but the actual
+                 elitism logic happens in the calling code.
+                 
+    Returns:
+        List of top n_parents individuals sorted by fitness (descending).
+    """
+    if not population:
         return []
     
-    selected = [sorted_pop[0]]
-    if n_parents == 1:
-        return selected
-    
-    best_code = sorted_pop[0].code or ""
-    
-    for ind in sorted_pop[1:]:
-        if (ind.code or "") != best_code:
-            selected.append(ind)
-            break
-    
-    if len(selected) < 2 and len(sorted_pop) > 1:
-        selected.append(sorted_pop[1])
-    
-    seen_codes = {s.code or "" for s in selected}
-    for ind in sorted_pop[2:]:
-        if len(selected) >= n_parents:
-            break
-        if (ind.code or "") not in seen_codes:
-            seen_codes.add(ind.code or "")
-            selected.append(ind)
-    
-    for ind in sorted_pop:
-        if len(selected) >= n_parents:
-            break
-        if ind not in selected:
-            selected.append(ind)
-    
-    return selected
+    # Simple deterministic selection: sort by fitness and take top n
+    # This matches baseline LLaMEA exactly
+    sorted_pop = sorted(population, key=lambda x: x.fitness, reverse=True)
+    return sorted_pop[:n_parents]
 
 
 # ==============================================================================
@@ -819,7 +984,7 @@ def run_mada_evolutionary_mode(
     n_offspring,
 ):
     """
-    MADA-LLAMEA main evolutionary loop with behavioral diversity rewards.
+    MADA-LLAMEA v2 main evolutionary loop with 3 operators.
     """
     
     # MADA State Initialization
@@ -841,7 +1006,7 @@ def run_mada_evolutionary_mode(
     
     # Phase 1: Initialization
     print(f"\n{'='*60}")
-    print(f"MADA-LLAMEA INITIALIZATION: Generating {n_parents} parents")
+    print(f"MADA-LLAMEA v2 INITIALIZATION: Generating {n_parents} parents")
     print('='*60)
     
     seen_hashes = set()
@@ -856,6 +1021,7 @@ def run_mada_evolutionary_mode(
             while retries <= 3:
                 message = algorithm_manager.fetch_algorithm()
                 
+                # Extract code
                 pattern = r"```(?:python)?\n(.*?)\n```"
                 match = re.search(pattern, message, re.DOTALL | re.IGNORECASE)
                 if not match:
@@ -863,11 +1029,17 @@ def run_mada_evolutionary_mode(
                     continue
                 algorithm_code = match.group(1)
                 
+                # Extract class name
                 class_match = re.search(r"class\s+(\w+)", algorithm_code)
                 if not class_match:
                     retries += 1
                     continue
                 algorithm_name = class_match.group(1)
+                
+                # Extract description
+                desc_pattern = r"#\s*Description:\s*(.+?)(?:\n|$)"
+                desc_match = re.search(desc_pattern, message, re.IGNORECASE)
+                algorithm_description = desc_match.group(1).strip() if desc_match else algorithm_name
 
                 code_hash = hashlib.sha256(algorithm_code.encode()).hexdigest()
                 if code_hash in seen_hashes:
@@ -877,6 +1049,7 @@ def run_mada_evolutionary_mode(
                 solution = MADASolution(
                     code=algorithm_code,
                     name=algorithm_name,
+                    description=algorithm_description,
                     generation=generation,
                 )
                 solution.operator = "init"
@@ -889,14 +1062,17 @@ def run_mada_evolutionary_mode(
                 if error:
                     solution.fitness = 0.0
                     solution.error = error
+                    solution.feedback = f"The algorithm got an error: {error}. "
                     print(f"  Error: {error}")
                     retries += 1
                     continue
                 else:
                     solution.fitness = float(np.mean(aucs))
+                    solution.fitness_std = float(np.std(aucs))
                     solution.aucs = aucs
                     solution.detailed_aucs = detailed_aucs
                     solution.trace = trace
+                    solution.feedback = ""  # No feedback for successful execution
                     seen_hashes.add(code_hash)
                     print(f"  Fitness: {solution.fitness:.4f}")
                     
@@ -908,6 +1084,7 @@ def run_mada_evolutionary_mode(
                 population.append(solution)
                 explogger.log_code(api_calls, algorithm_name, algorithm_code)
                 explogger.log_aucs(api_calls, aucs if aucs else [0])
+                
                 api_calls += 1
                 break
 
@@ -931,6 +1108,7 @@ def run_mada_evolutionary_mode(
             break
         
         generation = gen
+        mada_operator.current_generation = gen  # Track for warmup
         current_alpha = alpha_scheduler.get_alpha(generation - 1)
         
         print(f"\n{'='*60}")
@@ -941,11 +1119,18 @@ def run_mada_evolutionary_mode(
         
         bandit_state = mada_operator.get_bandit_state()
         probs = bandit_state['selection_probs']
-        print(f"D-TS: mutation={probs['mutation']:.1%}, crossover={probs['crossover']:.1%}")
-        print('='*60)
+        # Print only enabled arms
+        prob_strs = []
+        for arm in mada_operator.bandit.arms:
+            prob_strs.append(f"{arm[:3]}={probs[arm]:.1%}")
+        print("D-TS: " + ", ".join(prob_strs))
         
         parents = selection(population, n_parents, elitism=args.elitism)
         best_parent_fitness = max((p.fitness for p in parents), default=0.0)
+        
+        # Set population and best_ever for baseline LLAMEA style prompts
+        mada_operator.population = parents
+        mada_operator.best_ever = best_ever
         
         mada_operator.reset_generation_counts()
         offspring = []
@@ -964,7 +1149,8 @@ def run_mada_evolutionary_mode(
                 )
                 
                 operator = selection_info['operator']
-                print(f"  D-TS: {operator} (θ={selection_info['theta_sampled']:.3f})")
+                warmup_str = " [WARMUP]" if selection_info.get('warmup_forced', False) else ""
+                print(f"  D-TS: {operator} (θ={selection_info['theta_sampled']:.3f}){warmup_str}")
                 print(f"  Evaluating {child.name}...")
                 
                 aucs, detailed_aucs, trace, error = evaluate_algorithm_with_trace(
@@ -975,12 +1161,17 @@ def run_mada_evolutionary_mode(
                     child.fitness = 0.0
                     child.error = error
                     child.trace = []
+                    # Build feedback (baseline LLAMEA style)
+                    child.feedback = f"The algorithm got an error: {error}. "
                     print(f"  Error: {error}")
                 else:
                     child.fitness = float(np.mean(aucs))
+                    child.fitness_std = float(np.std(aucs))
                     child.aucs = aucs
                     child.detailed_aucs = detailed_aucs
                     child.trace = trace
+                    # Build feedback (baseline LLAMEA style - empty for successful execution)
+                    child.feedback = ""
                     print(f"  Fitness: {child.fitness:.4f}")
                     
                     if trace:
@@ -988,7 +1179,7 @@ def run_mada_evolutionary_mode(
                         global_max_fitness = max(global_max_fitness, max(trace))
                     
                     if child.fitness > best_ever.fitness:
-                        print(f"  🎉 NEW BEST! {child.fitness:.4f}")
+                        print(f"  *** NEW BEST! {child.fitness:.4f} ***")
                         best_ever = child
 
                 # MADA: Calculate NN-Dist
@@ -999,10 +1190,21 @@ def run_mada_evolutionary_mode(
                 
                 print(f"  NN-Dist: {nn_dist:.4f}")
                 
+                # Determine parent fitness from the actual parent(s) of this child
+                parent_fitness_for_reward = best_parent_fitness
+                if child.parent_ids:
+                    parent_lookup = {p.id: p.fitness for p in parents}
+                    parent_fitness_values = [
+                        parent_lookup.get(pid, None) for pid in child.parent_ids
+                    ]
+                    parent_fitness_values = [pf for pf in parent_fitness_values if pf is not None]
+                    if parent_fitness_values:
+                        parent_fitness_for_reward = max(parent_fitness_values)
+
                 # MADA: Composite reward
                 reward, fitness_delta, diversity_bonus = compute_composite_reward(
                     child_fitness=child.fitness,
-                    parent_fitness=best_parent_fitness,
+                    parent_fitness=parent_fitness_for_reward,
                     nn_dist=nn_dist,
                     alpha=current_alpha,
                     error=bool(error),
@@ -1028,7 +1230,7 @@ def run_mada_evolutionary_mode(
                 offspring_record = {
                     'operator': child.operator,
                     'fitness': child.fitness,
-                    'parent_fitness': best_parent_fitness,
+                    'parent_fitness': parent_fitness_for_reward,
                     'nn_dist': nn_dist,
                     'alpha': current_alpha,
                     'raw_reward': reward,
@@ -1045,6 +1247,7 @@ def run_mada_evolutionary_mode(
                 offspring.append(child)
                 explogger.log_code(api_calls, child.name, child.code)
                 explogger.log_aucs(api_calls, aucs if aucs else [0])
+                
                 api_calls += 1
 
             except Exception as e:
@@ -1067,11 +1270,11 @@ def run_mada_evolutionary_mode(
         log_bandit_snapshot(explogger, generation, bandit_state)
         
         stats = mada_operator.get_operator_stats()
-        print(f"Operators: {stats['mutation_count']} mut, {stats['crossover_count']} xo")
+        print(f"Operators: {stats['mutation_count']} mut, {stats['crossover_count']} xo, {stats['refine_count']} ref")
     
     # Final Summary
     print(f"\n{'='*60}")
-    print("MADA-LLAMEA COMPLETED")
+    print("MADA-LLAMEA v2 COMPLETED")
     print('='*60)
     print(f"Total API calls: {api_calls}")
     print(f"Generations: {generation}")
@@ -1079,7 +1282,7 @@ def run_mada_evolutionary_mode(
     print(f"Traces collected: {len(history_traces)}")
     
     final_state = mada_operator.get_bandit_state()
-    print(f"\nFinal Bandit:")
+    print(f"\nFinal Bandit (3 operators):")
     for arm, s in final_state['arm_stats'].items():
         print(f"  {arm}: pulls={s['pulls']}, μ̂={s['mu_hat']:.3f}, fit_r={s['total_fitness_reward']:.3f}, div_r={s['total_diversity_reward']:.3f}")
     
@@ -1098,7 +1301,7 @@ def run_mada_evolutionary_mode(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MADA-LLAMEA: Multi-Adaptive Diverse Algorithm with LLM Evolution',
+        description='MADA-LLAMEA v2: Multi-Adaptive Diverse Algorithm with 3 Operators',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -1108,8 +1311,8 @@ def main():
     parser.add_argument('--max-tokens', type=int, help='Max tokens')
     
     # Model Configuration  
-    parser.add_argument('--model', type=str, default='gemini-2.0-flash', help='AI model')
-    parser.add_argument('--experiment-name', type=str, default='mada-experiment', help='Experiment name')
+    parser.add_argument('--model', type=str, default='google/gemini-2.5-flash', help='AI model')
+    parser.add_argument('--experiment-name', type=str, default='mada-v2-experiment', help='Experiment name')
     
     # Experiment Configuration
     parser.add_argument('--budget', type=int, default=100, help='API budget')
@@ -1125,8 +1328,12 @@ def main():
     # D-TS Configuration
     parser.add_argument('--discount', type=float, default=0.9, help='D-TS discount γ')
     parser.add_argument('--tau-max', type=float, default=1.0, help='D-TS τ_max')
-    parser.add_argument('--reward-variance', type=float, default=0.25, help='D-TS reward variance')
+    parser.add_argument('--reward-variance', type=float, default=1.0, help='D-TS reward variance')
     parser.add_argument('--reward-clamp', type=float, default=1.0, help='Reward clamp')
+    parser.add_argument('--disable-mutation', action='store_true', help='Disable mutation operator')
+    parser.add_argument('--disable-crossover', action='store_true', help='Disable crossover operator')
+    parser.add_argument('--warmup-refine', type=int, default=0,
+                       help='Force refine operator for first N generations (default: 0, disabled)')
     
     # MADA Configuration
     parser.add_argument('--alpha-start', type=float, default=0.5, help='Initial diversity weight α')
@@ -1142,6 +1349,10 @@ def main():
     parser.add_argument('--no-behavioral-selection', dest='behavioral_selection',
                        action='store_false',
                        help='Disable behavioral selection, use fitness-based selection instead')
+    
+    # Detailed Feedback
+    parser.add_argument('--detailed-feedback', action='store_true', default=False,
+                       help='Enable detailed per-function-group performance feedback in prompts')
     
     args = parser.parse_args()
     
@@ -1170,13 +1381,18 @@ def main():
     )
 
     if args.evolutionary_mode:
-        mada_operator = MADAOperator(
+        mada_operator = MADAOperatorV2(
             algorithm_manager,
             discount=args.discount,
             tau_max=args.tau_max,
             reward_variance=args.reward_variance,
             reward_clamp=args.reward_clamp,
             use_behavioral_selection=args.behavioral_selection,
+            detailed_feedback=args.detailed_feedback,
+            enable_mutation=not args.disable_mutation,
+            enable_crossover=not args.disable_crossover,
+            enable_refine=True,
+            warmup_refine=args.warmup_refine,
         )
         
         if args.generations is not None:
@@ -1184,7 +1400,7 @@ def main():
         else:
             generations = max(1, (args.budget - args.n_parents) // args.n_offspring)
         
-        print(f"\nStarting MADA-LLAMEA:")
+        print(f"\nStarting MADA-LLAMEA v2 (3 Operators):")
         print(f"  Model: {ai_model}")
         print(f"  Budget: {args.budget}")
         print(f"  Parents (μ): {args.n_parents}")
@@ -1192,7 +1408,10 @@ def main():
         print(f"  Generations: {generations}")
         print(f"  D-TS: γ={args.discount}, τ_max={args.tau_max}")
         print(f"  MADA: α={args.alpha_start}→{args.alpha_end} ({args.alpha_schedule})")
+        print(f"  Operators: mutation, crossover, refine")
+        print(f"  Warmup Refine: {args.warmup_refine} generations" if args.warmup_refine > 0 else "  Warmup Refine: disabled")
         print(f"  Behavioral Selection: {'enabled' if args.behavioral_selection else 'disabled'}")
+        print(f"  Detailed Feedback: {'enabled' if args.detailed_feedback else 'disabled'}")
         print("-" * 60)
         
         run_mada_evolutionary_mode(
@@ -1205,7 +1424,7 @@ def main():
             args.n_offspring,
         )
     else:
-        print("ERROR: MADA-LLAMEA requires --evolutionary-mode flag")
+        print("ERROR: MADA-LLAMEA v2 requires --evolutionary-mode flag")
         return
     
     print(f"\nResults saved in: {explogger.dirname}")
@@ -1213,4 +1432,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
